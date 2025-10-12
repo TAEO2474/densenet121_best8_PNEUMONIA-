@@ -1,148 +1,195 @@
+# app.py
 import os
 import io
 import numpy as np
 import streamlit as st
-from PIL import Image
-
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras.applications.densenet import preprocess_input as densenet_preprocess
+from tensorflow.keras.applications.densenet import preprocess_input
+from PIL import Image
+import cv2
+import gdown
 
-# ================== Config ==================
-st.set_page_config(page_title="CXR Classifier + Grad-CAM", layout="wide")
-
-MODEL_PATH = "./models/densenet121_best_9.keras"
-# DenseNet121 마지막 큰 피처맵(Grad-CAM에 적합)
-LAST_CONV_LAYER_NAME = "conv5_block16_concat"
-
+# -----------------------------
+# Page / Constants
+# -----------------------------
+st.set_page_config(page_title="CXR Pneumonia Classifier (DenseNet121)", layout="wide")
 CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 IMG_SIZE = (224, 224)
 
-# ================== Utils ==================
-def load_image(file) -> np.ndarray:
-    """Load file -> RGB numpy (H, W, 3) uint8."""
-    pil = Image.open(file).convert("RGB")
-    pil = pil.resize(IMG_SIZE)
-    return np.array(pil)
+# ▶▶ Put your Google Drive FILE ID here
+FILE_ID = "PASTE_YOUR_DRIVE_FILE_ID_HERE"
+MODEL_URL = f"https://drive.google.com/uc?id={FILE_ID}"
 
-def overlay_heatmap_on_image(img_uint8, heatmap, alpha=0.40):
-    """img_uint8: (H,W,3) uint8, heatmap: (H,W) float [0,1]"""
-    try:
-        import cv2  # use OpenCV if available
-        hm = (heatmap * 255).astype(np.uint8)
-        hm = cv2.applyColorMap(hm, cv2.COLORMAP_JET)      # (H,W,3) BGR uint8
-        hm = cv2.cvtColor(hm, cv2.COLOR_BGR2RGB)          # to RGB
-        out = (hm * alpha + img_uint8 * (1 - alpha)).clip(0, 255).astype(np.uint8)
-        return out
-    except Exception:
-        # Fallback without OpenCV (PIL)
-        from PIL import ImageOps
-        h = (heatmap * 255).astype(np.uint8)
-        hm = Image.fromarray(h, mode="L").resize(img_uint8.shape[:2][::-1], Image.BILINEAR)
-        hm = ImageOps.colorize(hm, black="blue", white="red")  # simple colormap
-        hm = np.array(hm)
-        out = (hm * alpha + img_uint8 * (1 - alpha)).clip(0, 255).astype(np.uint8)
-        return out
+MODEL_DIR = "models"
+MODEL_LOCAL = os.path.join(MODEL_DIR, "densenet121_best_9.keras")
+os.makedirs(MODEL_DIR, exist_ok=True)
 
-# ================== Model ==================
+# -----------------------------
+# Utils: download & load model
+# -----------------------------
 @st.cache_resource
-def load_model():
+def ensure_model_file() -> str:
+    """Download model from Google Drive if not exists."""
+    if not os.path.exists(MODEL_LOCAL):
+        with st.spinner("Downloading model from Google Drive..."):
+            gdown.download(MODEL_URL, MODEL_LOCAL, quiet=False)
+    return MODEL_LOCAL
+
+@st.cache_resource
+def load_model(model_path: str):
+    """Load Keras model with Lambda(preprocess_input) deserialization."""
     try:
         model = keras.models.load_model(
-            MODEL_PATH,
-            custom_objects={"preprocess_input": densenet_preprocess},  # Lambda 포함 모델 복원용
-            safe_mode=False
+            model_path,
+            custom_objects={"preprocess_input": preprocess_input},
+            safe_mode=False,
+            compile=False,
         )
-        # Grad-CAM용 서브모델 (conv feature, 최종 출력 동시 반환)
-        last_conv = model.get_layer("densenet121").get_layer(LAST_CONV_LAYER_NAME)
-        grad_model = keras.Model(
-            inputs=model.inputs,
-            outputs=[last_conv.output, model.output]
-        )
-        return model, grad_model
+        return model
     except Exception as e:
-        st.error(f"Failed to load model: {e}")
-        st.info("Check MODEL_PATH and make sure the .keras file exists in your repo.")
-        return None, None
+        st.error(f"Model load error: {e}")
+        st.stop()
 
-model, grad_model = load_model()
+# -----------------------------
+# Grad-CAM helpers
+# -----------------------------
+def find_base_model(m):
+    """Try to locate DenseNet base (by name or type)."""
+    try:
+        return m.get_layer("densenet121")
+    except Exception:
+        # fallback: first Functional/Model inside, or last conv-like backbone
+        for lyr in m.layers[::-1]:
+            if isinstance(lyr, keras.Model):
+                return lyr
+        return m  # worst-case: use whole model
 
-# ================== Grad-CAM ==================
-def gradcam(img_batch):
+def find_last_conv_name(base):
+    """Pick a suitable last conv/concat/relu-like layer for Grad-CAM."""
+    candidates = []
+    for lyr in base.layers:
+        name = lyr.name.lower()
+        if ("conv" in name) or ("concat" in name) or ("relu" in name):
+            candidates.append(lyr)
+    return (candidates[-1].name) if candidates else base.layers[-1].name
+
+@tf.function
+def _normalize_heatmap(x):
+    x = tf.maximum(x, 0.0)
+    mx = tf.reduce_max(x)
+    return tf.where(mx > 0, x / mx, x)
+
+def make_gradcam_heatmap(img_preprocessed_bchw, model, last_conv_layer_name: str):
     """
-    img_batch: float32 (1, H, W, 3), **no manual preprocess** (model has Lambda)
-    returns: heatmap (H, W) float [0,1], pred_prob float
+    img_preprocessed_bchw: preprocessed, shape [1, H, W, 3]  (DenseNet rule)
+    Returns: heatmap [Hc, Wc]
     """
+    base = find_base_model(model)
+    try:
+        last_conv = base.get_layer(last_conv_layer_name)
+    except Exception:
+        last_conv_layer_name = find_last_conv_name(base)
+        last_conv = base.get_layer(last_conv_layer_name)
+
+    # 1) model: inputs -> last_conv feature
+    last_conv_model = keras.Model(model.input, last_conv.output)
+
+    # 2) tail model: last_conv feature -> prediction
+    #    재연결: last_conv 이후의 레이어만 차례로 통과
+    #    Trick: functional graph를 재사용하기 어렵다면, 직접 forward 구성
+    #    여기서는 간단히 "중간출력 모델" + "전체 모델" 순전파에서 그래드만 가져오는 구조로 처리
     with tf.GradientTape() as tape:
-        conv_out, preds = grad_model(img_batch, training=False)
-        prob = preds[:, 0]  # sigmoid output for class=1 (PNEUMONIA)
-        # target: class 1 (PNEUMONIA). If you want "predicted class", remove [:,0] selection.
-    grads = tape.gradient(prob, conv_out)  # d(prob)/d(conv)
-    if grads is None:
-        return None, float(prob.numpy()[0])
+        conv_out = last_conv_model(img_preprocessed_bchw)
+        tape.watch(conv_out)
+        # 전체 모델의 예측(스칼라 sigmoid) 취득
+        preds = model(img_preprocessed_bchw, training=False)
+        # 양성(폐렴, class=1) score에 대해 CAM 생성
+        class_channel = preds[:, 0]
 
-    # Global-average-pool the gradients over H,W
-    pooled_grads = tf.reduce_mean(grads, axis=(1, 2), keepdims=True)  # (1, H, W, C) -> (1,1,1,C)
-    # Weight conv feature maps
-    cam = tf.reduce_sum(pooled_grads * conv_out, axis=-1)  # (1,H,W)
-    cam = cam[0]
+    grads = tape.gradient(class_channel, conv_out)                  # d(score)/d(feature)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))            # GAP over HWC
+    conv_out = conv_out[0]                                          # [Hc, Wc, C]
+    heatmap = tf.reduce_sum(conv_out * pooled_grads, axis=-1)       # [Hc, Wc]
+    heatmap = _normalize_heatmap(heatmap)
+    return heatmap.numpy()
 
-    # ReLU + normalize to [0,1]
-    cam = tf.maximum(cam, 0)
-    cam = cam / (tf.reduce_max(cam) + 1e-8)
-    return cam.numpy(), float(prob.numpy()[0])
+def overlay_heatmap(rgb_uint8, heatmap, alpha=0.4):
+    h, w = rgb_uint8.shape[:2]
+    hm = cv2.resize(heatmap, (w, h))
+    hm = np.uint8(255 * hm)
+    jet = cv2.applyColorMap(hm, cv2.COLORMAP_JET)
+    jet = cv2.cvtColor(jet, cv2.COLOR_BGR2RGB)
+    out = (jet * alpha + rgb_uint8 * (1 - alpha)).clip(0, 255).astype(np.uint8)
+    return out
 
-# ================== UI ==================
-st.title("Chest X-ray Classifier (DenseNet121) + Grad-CAM")
+# -----------------------------
+# Inference
+# -----------------------------
+def prepare_inputs(pil_img: Image.Image):
+    """Return (img_uint8_rgb, bchw_raw, bchw_preprocessed)."""
+    pil = pil_img.convert("RGB").resize(IMG_SIZE)
+    arr = np.array(pil, dtype=np.uint8)
+    bchw_raw = np.expand_dims(arr.astype(np.float32), axis=0)  # model 내부에 preprocess Lambda 존재
+    bchw_pp  = preprocess_input(bchw_raw.copy())               # Grad-CAM 경로에 사용
+    return arr, bchw_raw, bchw_pp
 
-left, right = st.columns([2, 1])
-with right:
-    thr = st.slider("Decision Threshold (PNEUMONIA)", min_value=0.50, max_value=0.69, value=0.50, step=0.01)
-    alpha = st.slider("Heatmap Alpha", 0.1, 0.8, 0.40, 0.05)
+def predict_pneumonia_prob(model, bchw_raw):
+    """Sigmoid output for class=1 (PNEUMONIA)."""
+    prob = model.predict(bchw_raw, verbose=0).squeeze().item()
+    return float(prob)
 
-st.markdown("---")
-file = st.file_uploader("Upload a chest X-ray (JPG/PNG)", type=["jpg", "jpeg", "png"])
+# -----------------------------
+# Sidebar
+# -----------------------------
+with st.sidebar:
+    st.header("Settings")
+    thresh = st.slider("Decision threshold (PNEUMONIA)", 0.50, 0.69, 0.50, 0.01)
+    st.caption("• Lower = higher sensitivity for pneumonia\n• Higher = fewer false positives")
 
-if model is None or grad_model is None:
-    st.stop()
+# -----------------------------
+# Main UI
+# -----------------------------
+st.title("Chest X-ray Pneumonia Classifier (DenseNet121)")
+st.write("Upload a chest X-ray, get a prediction and Grad-CAM visualization. **This is not a medical device.**")
 
-if file is not None:
-    img_uint8 = load_image(file)                 # (224,224,3) uint8
-    img_batch = img_uint8.astype("float32")[None, ...]  # (1,224,224,3)
+model_path = ensure_model_file()
+model = load_model(model_path)
 
-    run = st.button("Run Inference")
-    if run:
-        with st.spinner("Running inference and Grad-CAM..."):
-            # model includes preprocess Lambda; feed raw float32 0..255
-            heatmap, prob_pneumonia = gradcam(img_batch)
+up = st.file_uploader("Upload an X-ray image (JPG/PNG)", type=["jpg", "jpeg", "png"])
+if up is not None:
+    pil_img = Image.open(up)
+    rgb_uint8, x_raw_bchw, x_pp_bchw = prepare_inputs(pil_img)
 
-            # decision
-            y_pred = 1 if prob_pneumonia >= thr else 0
-            cls = CLASS_NAMES[y_pred]
-            prob_show = prob_pneumonia if y_pred == 1 else (1 - prob_pneumonia)
+    colA, colB = st.columns([1, 1])
+    with colA:
+        st.image(rgb_uint8, caption="Input (Resized 224×224)", use_container_width=True)
 
-            # viz
-            if heatmap is not None:
-                # resize heatmap to image size
-                heatmap = tf.image.resize(heatmap[..., None], IMG_SIZE, method="bilinear").numpy().squeeze()
-                cam_img = overlay_heatmap_on_image(img_uint8, heatmap, alpha=alpha)
-            else:
-                cam_img = img_uint8
+    if st.button("Run inference"):
+        with st.spinner("Running model..."):
+            p_pneu = predict_pneumonia_prob(model, x_raw_bchw)
+            pred_label = CLASS_NAMES[1] if p_pneu >= thresh else CLASS_NAMES[0]
+            conf = p_pneu if pred_label == "PNEUMONIA" else (1 - p_pneu)
 
-        # ===== Show results =====
-        color_box = st.error if y_pred == 1 else st.success
-        color_box(f"**Predicted: {cls}**  |  **Confidence:** {prob_show*100:.2f}%  |  **Threshold:** {thr:.2f}")
-        st.caption("Class mapping: 0 = NORMAL, 1 = PNEUMONIA (probability is PNEUMONIA).")
+            # Grad-CAM
+            base = find_base_model(model)
+            last_layer_name = find_last_conv_name(base)
+            heatmap = make_gradcam_heatmap(x_pp_bchw, model, last_layer_name)
+            cam_img = overlay_heatmap(rgb_uint8, heatmap, alpha=0.45)
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.image(img_uint8, caption="Input Image", use_column_width=True)
-        with c2:
-            st.image(cam_img, caption="Grad-CAM Overlay", use_column_width=True)
+        with colB:
+            st.image(cam_img, caption=f"Grad-CAM (last: {last_layer_name})", use_container_width=True)
 
-        st.markdown("**Raw probabilities**")
-        st.json({"PNEUMONIA (class=1)": round(float(prob_pneumonia), 4),
-                 "NORMAL (class=0)": round(float(1 - prob_pneumonia), 4)})
+        st.subheader("Prediction")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Predicted class", pred_label)
+        col2.metric("Prob. PNEUMONIA", f"{p_pneu*100:.2f}%")
+        col3.metric("Confidence", f"{conf*100:.2f}%")
 
+        st.info(
+            "• Threshold tuning: set **0.50** to prioritize catching pneumonia (higher sensitivity), "
+            "or **0.69** to reduce false positives and protect normals.\n"
+            "• Use alongside clinical judgment and radiologist review."
+        )
 else:
-    st.info("Please upload an image to begin.")
+    st.caption("Awaiting an image upload…")
