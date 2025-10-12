@@ -1,6 +1,5 @@
 # app.py
 import os
-import io
 import numpy as np
 import streamlit as st
 import tensorflow as tf
@@ -17,10 +16,8 @@ st.set_page_config(page_title="CXR Pneumonia Classifier (DenseNet121)", layout="
 CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 IMG_SIZE = (224, 224)
 
-# ▶▶ Put your Google Drive FILE ID here
-FILE_ID = "PASTE_YOUR_DRIVE_FILE_ID_HERE"
-MODEL_URL = f"https://drive.google.com/uc?id={FILE_ID}"
-
+# ▶▶ Put your Google Drive FILE ID here (NO underscore)
+FILE_ID = "1t9rkQ6_gFte9xFZwTHne2hZPH2MGTNg"   # ← 여기에 본인 ID 입력
 MODEL_DIR = "models"
 MODEL_LOCAL = os.path.join(MODEL_DIR, "densenet121_best_9.keras")
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -28,42 +25,40 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 # -----------------------------
 # Utils: download & load model
 # -----------------------------
-@st.cache_resource
+@st.cache_data(show_spinner=False)
 def ensure_model_file() -> str:
-    """Download model from Google Drive if not exists."""
-    if not os.path.exists(MODEL_LOCAL):
-        with st.spinner("Downloading model from Google Drive..."):
-            gdown.download(MODEL_URL, MODEL_LOCAL, quiet=False)
+    """Download model from Google Drive (public) if not exists."""
+    if not os.path.exists(MODEL_LOCAL) or os.path.getsize(MODEL_LOCAL) == 0:
+        with st.spinner("📥 Downloading model from Google Drive..."):
+            # 공개 파일 다운로드: 쿠키 미사용
+            gdown.download(id=FILE_ID, output=MODEL_LOCAL, quiet=False, use_cookies=False)
+    if not os.path.exists(MODEL_LOCAL) or os.path.getsize(MODEL_LOCAL) == 0:
+        raise RuntimeError("Failed to download the model file.")
     return MODEL_LOCAL
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_model(model_path: str):
-    """Load Keras model with Lambda(preprocess_input) deserialization."""
-    try:
-        model = keras.models.load_model(
-            model_path,
-            custom_objects={"preprocess_input": preprocess_input},
-            safe_mode=False,
-            compile=False,
-        )
-        return model
-    except Exception as e:
-        st.error(f"Model load error: {e}")
-        st.stop()
+    """Load Keras model with preprocess_input (Lambda) deserialization."""
+    model = keras.models.load_model(
+        model_path,
+        custom_objects={"preprocess_input": preprocess_input},
+        safe_mode=False,
+        compile=False,
+    )
+    return model
 
 # -----------------------------
 # Grad-CAM helpers
 # -----------------------------
 def find_base_model(m):
-    """Try to locate DenseNet base (by name or type)."""
+    """Try to locate DenseNet base (by name or nested Model)."""
     try:
         return m.get_layer("densenet121")
     except Exception:
-        # fallback: first Functional/Model inside, or last conv-like backbone
         for lyr in m.layers[::-1]:
             if isinstance(lyr, keras.Model):
                 return lyr
-        return m  # worst-case: use whole model
+        return m
 
 def find_last_conv_name(base):
     """Pick a suitable last conv/concat/relu-like layer for Grad-CAM."""
@@ -82,7 +77,7 @@ def _normalize_heatmap(x):
 
 def make_gradcam_heatmap(img_preprocessed_bchw, model, last_conv_layer_name: str):
     """
-    img_preprocessed_bchw: preprocessed, shape [1, H, W, 3]  (DenseNet rule)
+    img_preprocessed_bchw: preprocessed, shape [1, H, W, 3]
     Returns: heatmap [Hc, Wc]
     """
     base = find_base_model(model)
@@ -92,25 +87,18 @@ def make_gradcam_heatmap(img_preprocessed_bchw, model, last_conv_layer_name: str
         last_conv_layer_name = find_last_conv_name(base)
         last_conv = base.get_layer(last_conv_layer_name)
 
-    # 1) model: inputs -> last_conv feature
     last_conv_model = keras.Model(model.input, last_conv.output)
 
-    # 2) tail model: last_conv feature -> prediction
-    #    재연결: last_conv 이후의 레이어만 차례로 통과
-    #    Trick: functional graph를 재사용하기 어렵다면, 직접 forward 구성
-    #    여기서는 간단히 "중간출력 모델" + "전체 모델" 순전파에서 그래드만 가져오는 구조로 처리
     with tf.GradientTape() as tape:
         conv_out = last_conv_model(img_preprocessed_bchw)
         tape.watch(conv_out)
-        # 전체 모델의 예측(스칼라 sigmoid) 취득
         preds = model(img_preprocessed_bchw, training=False)
-        # 양성(폐렴, class=1) score에 대해 CAM 생성
-        class_channel = preds[:, 0]
+        class_channel = preds[:, 0]  # class=1 (PNEUMONIA) score
 
-    grads = tape.gradient(class_channel, conv_out)                  # d(score)/d(feature)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))            # GAP over HWC
-    conv_out = conv_out[0]                                          # [Hc, Wc, C]
-    heatmap = tf.reduce_sum(conv_out * pooled_grads, axis=-1)       # [Hc, Wc]
+    grads = tape.gradient(class_channel, conv_out)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_out = conv_out[0]  # [Hc, Wc, C]
+    heatmap = tf.reduce_sum(conv_out * pooled_grads, axis=-1)
     heatmap = _normalize_heatmap(heatmap)
     return heatmap.numpy()
 
@@ -130,8 +118,8 @@ def prepare_inputs(pil_img: Image.Image):
     """Return (img_uint8_rgb, bchw_raw, bchw_preprocessed)."""
     pil = pil_img.convert("RGB").resize(IMG_SIZE)
     arr = np.array(pil, dtype=np.uint8)
-    bchw_raw = np.expand_dims(arr.astype(np.float32), axis=0)  # model 내부에 preprocess Lambda 존재
-    bchw_pp  = preprocess_input(bchw_raw.copy())               # Grad-CAM 경로에 사용
+    bchw_raw = np.expand_dims(arr.astype(np.float32), axis=0)  # model 내부에 preprocess Lambda가 있어도 안전
+    bchw_pp  = preprocess_input(bchw_raw.copy())               # Grad-CAM 경로에서 사용
     return arr, bchw_raw, bchw_pp
 
 def predict_pneumonia_prob(model, bchw_raw):
@@ -153,8 +141,17 @@ with st.sidebar:
 st.title("Chest X-ray Pneumonia Classifier (DenseNet121)")
 st.write("Upload a chest X-ray, get a prediction and Grad-CAM visualization. **This is not a medical device.**")
 
-model_path = ensure_model_file()
-model = load_model(model_path)
+try:
+    model_path = ensure_model_file()
+except Exception as e:
+    st.error(f"Model download error: {e}")
+    st.stop()
+
+try:
+    model = load_model(model_path)
+except Exception as e:
+    st.error(f"Model load error: {e}")
+    st.stop()
 
 up = st.file_uploader("Upload an X-ray image (JPG/PNG)", type=["jpg", "jpeg", "png"])
 if up is not None:
@@ -171,7 +168,6 @@ if up is not None:
             pred_label = CLASS_NAMES[1] if p_pneu >= thresh else CLASS_NAMES[0]
             conf = p_pneu if pred_label == "PNEUMONIA" else (1 - p_pneu)
 
-            # Grad-CAM
             base = find_base_model(model)
             last_layer_name = find_last_conv_name(base)
             heatmap = make_gradcam_heatmap(x_pp_bchw, model, last_layer_name)
