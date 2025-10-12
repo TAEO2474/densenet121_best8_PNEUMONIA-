@@ -1,5 +1,6 @@
 # app.py
 import os
+from pathlib import Path
 import numpy as np
 import streamlit as st
 import tensorflow as tf
@@ -8,6 +9,7 @@ from tensorflow.keras.applications.densenet import preprocess_input
 from PIL import Image
 import cv2
 import gdown
+import requests
 
 # -----------------------------
 # Page / Constants
@@ -17,24 +19,63 @@ CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 IMG_SIZE = (224, 224)
 
 # ▶▶ Put your Google Drive FILE ID here (NO underscore)
-FILE_ID = "1t9rkQ6_gFte9xFZwTHne2hZPH2MGTNg"   # ← 여기에 본인 ID 입력
-MODEL_DIR = "models"
-MODEL_LOCAL = os.path.join(MODEL_DIR, "densenet121_best_9.keras")
-os.makedirs(MODEL_DIR, exist_ok=True)
+FILE_ID = "1t9rkQ6_gFte9xFZwTHne2hZPH2MGTNg"   # ← 본인 ID (언더바 X)
+
+MODEL_DIR = Path("models")
+MODEL_LOCAL = MODEL_DIR / "densenet121_best_9.keras"
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+# ▶ (선택) 드라이브가 막히면 사용할 직링크(HF/GitHub 등)를 Secrets에 넣어두세요.
+HTTP_FALLBACK_URL = st.secrets.get("MODEL_DIRECT_URL", "")  # 예: https://huggingface.co/.../resolve/main/densenet121_best_9.keras
+TIMEOUT = 120
 
 # -----------------------------
 # Utils: download & load model
 # -----------------------------
+def _http_download(url: str, out: Path) -> bool:
+    try:
+        with requests.get(url, stream=True, timeout=TIMEOUT) as r:
+            r.raise_for_status()
+            with open(out, "wb") as f:
+                for chunk in r.iter_content(1 << 20):
+                    if chunk:
+                        f.write(chunk)
+        return out.exists() and out.stat().st_size > 0
+    except Exception as e:
+        st.warning(f"HTTP download failed: {e}")
+        return False
+
 @st.cache_data(show_spinner=False)
-def ensure_model_file() -> str:
-    """Download model from Google Drive (public) if not exists."""
-    if not os.path.exists(MODEL_LOCAL) or os.path.getsize(MODEL_LOCAL) == 0:
-        with st.spinner("📥 Downloading model from Google Drive..."):
-            # 공개 파일 다운로드: 쿠키 미사용
-            gdown.download(id=FILE_ID, output=MODEL_LOCAL, quiet=False, use_cookies=False)
-    if not os.path.exists(MODEL_LOCAL) or os.path.getsize(MODEL_LOCAL) == 0:
-        raise RuntimeError("Failed to download the model file.")
-    return MODEL_LOCAL
+def ensure_model_file_cached() -> str:
+    """
+    Try: (1) already exists → (2) gdown → (3) HTTP fallback.
+    성공 시 모델 경로 문자열 반환. 실패 시 예외 발생.
+    """
+    if MODEL_LOCAL.exists() and MODEL_LOCAL.stat().st_size > 0:
+        return str(MODEL_LOCAL)
+
+    # 1) gdown (공개 파일 전용, 쿠키 미사용)
+    try:
+        with st.spinner("📥 Downloading model from Google Drive (gdown)…"):
+            gdown.download(
+                id=FILE_ID,
+                output=str(MODEL_LOCAL),
+                quiet=False,
+                use_cookies=False,
+                fuzzy=True,           # 링크 변형에도 관대하게 처리
+            )
+        if MODEL_LOCAL.exists() and MODEL_LOCAL.stat().st_size > 0:
+            return str(MODEL_LOCAL)
+    except Exception as e:
+        st.warning(f"gdown failed: {e}")
+
+    # 2) HTTP 직링크 폴백
+    if HTTP_FALLBACK_URL:
+        with st.spinner("🌐 Downloading model via direct URL…"):
+            if _http_download(HTTP_FALLBACK_URL, MODEL_LOCAL):
+                return str(MODEL_LOCAL)
+
+    raise RuntimeError("다운로드 실패: Google Drive/직링크 모두 불가합니다.")
 
 @st.cache_resource(show_spinner=False)
 def load_model(model_path: str):
@@ -135,24 +176,43 @@ with st.sidebar:
     thresh = st.slider("Decision threshold (PNEUMONIA)", 0.50, 0.69, 0.50, 0.01)
     st.caption("• Lower = higher sensitivity for pneumonia\n• Higher = fewer false positives")
 
+    st.divider()
+    st.subheader("Model fallback")
+    st.caption("If download fails, upload your .keras model here and it will be cached.")
+    uploaded_model = st.file_uploader("Upload model (.keras)", type=["keras"])
+
 # -----------------------------
 # Main UI
 # -----------------------------
 st.title("Chest X-ray Pneumonia Classifier (DenseNet121)")
 st.write("Upload a chest X-ray, get a prediction and Grad-CAM visualization. **This is not a medical device.**")
 
+# 1) 모델 확보: 캐시 다운로드 → 실패 시 업로드 유도
+model_path = None
 try:
-    model_path = ensure_model_file()
+    model_path = ensure_model_file_cached()
 except Exception as e:
-    st.error(f"Model download error: {e}")
-    st.stop()
+    st.warning(f"Auto-download failed: {e}")
+    if uploaded_model is not None:
+        tmp_path = MODEL_DIR / "uploaded_model.keras"
+        with open(tmp_path, "wb") as f:
+            f.write(uploaded_model.read())
+        MODEL_LOCAL.unlink(missing_ok=True)
+        tmp_path.rename(MODEL_LOCAL)
+        st.success("✅ Uploaded model saved.")
+        model_path = str(MODEL_LOCAL)
+    else:
+        st.error("모델 자동 획득에 실패했습니다. 사이드바에서 .keras 모델을 업로드해 주세요.")
+        st.stop()
 
+# 2) 모델 로드
 try:
     model = load_model(model_path)
 except Exception as e:
     st.error(f"Model load error: {e}")
     st.stop()
 
+# 3) 예측 UI
 up = st.file_uploader("Upload an X-ray image (JPG/PNG)", type=["jpg", "jpeg", "png"])
 if up is not None:
     pil_img = Image.open(up)
