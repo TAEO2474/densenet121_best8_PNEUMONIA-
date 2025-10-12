@@ -1,0 +1,5 @@
+streamlit==1.38.0
+tensorflow==2.15.0
+pillow
+numpy
+# opencv-python  # (선택) OpenCV 쓰고 싶으면 주석 해제
