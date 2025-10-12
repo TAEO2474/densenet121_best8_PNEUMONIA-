@@ -1,5 +1,8 @@
 streamlit==1.38.0
-tensorflow==2.15.0
-pillow
+tensorflow-cpu==2.20.0        # Cloud에서 가볍고 잘 깔립니다
+keras==3.5.0                  # TF 2.20과 호환
 numpy
-# opencv-python  # (선택) OpenCV 쓰고 싶으면 주석 해제
+pillow
+gdown                         # Google Drive에서 모델 자동 다운로드
+opencv-python-headless        # Grad-CAM 합성용
+
