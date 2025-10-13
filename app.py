@@ -58,6 +58,7 @@ def ensure_model_file_cached() -> str:
 
 @st.cache_resource(show_spinner=False)
 def load_model(model_path: str):
+    # Lambda(preprocess_input) 복원 위해 custom_objects 등록
     return keras.models.load_model(
         model_path,
         custom_objects={"preprocess_input": preprocess_input},
@@ -67,6 +68,7 @@ def load_model(model_path: str):
 
 # ============================= Grad-CAM helpers =============================
 def find_base_model(m: keras.Model):
+    # Functional 안쪽의 densenet121 서브모델을 찾아 반환
     try:
         return m.get_layer("densenet121")
     except Exception:
@@ -87,42 +89,42 @@ def list_4d_layers(model_or_layer):
 
 def list_densenet_conv_names(base: keras.Model):
     names = [l.name for l in base.layers if _is_4d(l)]
-    # 이름 정렬(블록 순서 유지에 유리)
     names.sort()
     return names
 
 def get_densenet_feature_layer(base: keras.Model, preferred_name: str | None):
-    # 1) 사용자가 고른 이름 시도
-    try:
-        if preferred_name:
-            lyr = base.get_layer(preferred_name)
-            if _is_4d(lyr):
-                return lyr
-    except Exception:
-        pass
-    # 2) conv4 블록(해상도↑) 우선
-    four_d = [base.get_layer(n) for n in list_densenet_conv_names(base)]
-    conv4 = [l for l in four_d if "conv4_block" in l.name and "concat" in l.name]
+    names = list_densenet_conv_names(base)
+
+    # 선호 레이어가 실제 존재하면 그대로 사용
+    if preferred_name and preferred_name in names:
+        return base.get_layer(preferred_name)
+
+    # 권장 기본: conv4_block24_concat (있으면)
+    if "conv4_block24_concat" in names:
+        return base.get_layer("conv4_block24_concat")
+
+    # 그 외 conv4 concat 중 가장 뒤
+    conv4 = [n for n in names if ("conv4_block" in n and "concat" in n)]
     if conv4:
-        return conv4[-1]  # 가장 뒤 블록
-    # 3) conv5 기본 폴백
-    conv5 = [l for l in four_d if "conv5_block" in l.name and "concat" in l.name]
+        return base.get_layer(conv4[-1])
+
+    # conv5 concat 중 가장 뒤
+    conv5 = [n for n in names if ("conv5_block" in n and "concat" in n)]
     if conv5:
-        return conv5[-1]
-    # 4) 마지막 4D 레이어라도
-    return four_d[-1] if four_d else None
+        return base.get_layer(conv5[-1])
+
+    # 최후: 아무 4D 레이어 마지막
+    return base.get_layer(names[-1]) if names else None
 
 def _gaussian_blur(np_map: np.ndarray, kmin=3):
     H, W = np_map.shape[:2]
-    # 해상도 기반 커널 자동 결정 (최소 3, 홀수)
-    k = max(kmin, (min(H, W) // 4) | 1)
+    k = max(kmin, (min(H, W) // 4) | 1)  # 홀수 보장
     return cv2.GaussianBlur(np_map, (k, k), 0)
 
 def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class: int = 1):
     """
     반환: (heatmap [Hc,Wc] float32(0~1), method 'gradcam' | 'saliency', note(str))
     """
-    # 입력을 numpy float32로 보장
     if not isinstance(img_bchw, np.ndarray):
         img_bchw = np.array(img_bchw, dtype=np.float32)
     if img_bchw.dtype != np.float32:
@@ -132,13 +134,12 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
     try:
         grad_model = keras.Model(inputs=model.input, outputs=[conv_layer.output, model.output])
 
-        # name_scope 문제 회피: 예열은 predict로
+        # 예열 (graph 안정화)
         _ = model.predict(img_bchw, verbose=0)
 
         with tf.GradientTape() as tape:
             conv_out, preds = grad_model(img_bchw, training=False)
 
-            # preds / conv_out 정규화
             if isinstance(preds, dict):
                 preds = next(iter(preds.values()))
             if isinstance(preds, (list, tuple)):
@@ -150,7 +151,7 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
             conv_out = tf.convert_to_tensor(conv_out)
             tape.watch(conv_out)
 
-            # (N, C) 형태로 표준화
+            # (N, C) 정규화
             if preds.shape.rank is None or preds.shape.rank == 0:
                 preds = tf.reshape(preds, (-1, 1))
             elif preds.shape.rank == 1:
@@ -158,7 +159,6 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
 
             # 이진(sigmoid) vs 다중(softmax)
             if preds.shape[-1] == 1:
-                # target_class==1(폐렴) → p, 0(정상) → 1-p
                 class_channel = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
             else:
                 class_channel = preds[:, target_class]
@@ -172,17 +172,15 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
         weights = tf.reduce_mean(grads, axis=(0, 1, 2))          # [C]
         cam = tf.reduce_sum(conv_out[0] * weights, axis=-1)       # [Hc, Wc]
 
-        # 정규화
+        # 정규화 + 퍼센타일 스케일 + 스무딩
         cam = tf.where(tf.math.is_finite(cam), cam, 0.0)
         heat = tf.maximum(cam, 0.0)
         mx = tf.reduce_max(heat)
         heat = tf.where(mx > 0, heat / (mx + 1e-8), heat)
 
-        # 퍼센타일 스케일(점 현상 완화)
         p95 = float(np.percentile(heat.numpy(), 95.0))
         heat = tf.clip_by_value(heat / (p95 + 1e-6), 0.0, 1.0)
 
-        # 자동 스무딩
         heat_np = heat.numpy().astype(np.float32)
         heat_np = _gaussian_blur(heat_np, kmin=3)
 
@@ -193,8 +191,8 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
 
     # ===== B) 폴백: SmoothGrad Saliency =====
     x = tf.convert_to_tensor(img_bchw)
-    N = 12           # 샘플 수(증가하면 더 부드러움)
-    sigma = 0.10     # 입력(0~255)에 대한 노이즈 표준편차 비율
+    N = 12
+    sigma = 0.10
 
     acc = None
     for _ in range(N):
@@ -221,7 +219,6 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
     sal = acc / float(N)
     sal = sal / (tf.reduce_max(sal) + 1e-8)
 
-    # 스무딩 + 살짝 감마 보정
     sal_np = sal.numpy().astype(np.float32)
     sal_np = _gaussian_blur(sal_np, kmin=3)
     sal_np = np.power(np.clip(sal_np, 0.0, 1.0), 1.2)
@@ -239,10 +236,6 @@ def overlay_heatmap(rgb_uint8, heatmap, alpha=0.6):
 
 # ========= Lung mask (ellipses) =========
 def lung_mask_ellipses(h, w, cy_ratio=0.48, rx_ratio=0.23, ry_ratio=0.32, gap_ratio=0.10):
-    """
-    간단 타원 2개로 좌/우 폐 영역 근사 마스크 생성.
-    파라미터는 사이드바에서 조정 가능.
-    """
     mask = np.zeros((h, w), np.uint8)
     cx = w // 2
     cy = int(h * float(cy_ratio))
@@ -256,9 +249,6 @@ def lung_mask_ellipses(h, w, cy_ratio=0.48, rx_ratio=0.23, ry_ratio=0.32, gap_ra
     return (mask > 0).astype(np.float32)
 
 def apply_lung_mask(heatmap, cy_ratio, rx_ratio, ry_ratio, gap_ratio, thr=None):
-    """
-    heatmap:[H,W] -> 타원 마스크를 곱하고(폐 바깥=0), 선택적으로 임계값 이하 컷(thr) 적용
-    """
     h, w = heatmap.shape[:2]
     m = lung_mask_ellipses(h, w, cy_ratio, rx_ratio, ry_ratio, gap_ratio)
     masked = heatmap * m
@@ -289,7 +279,8 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Grad-CAM layer")
-    st.caption("기본: conv4 블록이 자동 선택됩니다(없으면 conv5). 필요시 다른 블록으로 비교해 보세요.")
+    st.caption("기본: conv4_block24_concat → 없으면 conv4 마지막 concat → conv5 마지막 concat.")
+    # CAM 레이어 목록은 모델 로드 후 본문에서 채움
 
     st.divider()
     st.subheader("Lung mask (ellipses)")
@@ -299,8 +290,7 @@ with st.sidebar:
         rx_ratio  = st.slider("radius x (ratio)", 0.15, 0.35, 0.23, 0.01)
         ry_ratio  = st.slider("radius y (ratio)", 0.20, 0.45, 0.32, 0.01)
         gap_ratio = st.slider("left/right gap (ratio)", 0.05, 0.20, 0.10, 0.01)
-        # 점 현상 방지: 기본 0.0 (컷 안 함)
-        thr_cut   = st.slider("heatmap threshold", 0.00, 0.80, 0.00, 0.01)
+        thr_cut   = st.slider("heatmap threshold", 0.00, 0.80, 0.00, 0.01)  # 기본 0.0 (컷 안 함)
 
     st.divider()
     st.subheader("Model fallback")
@@ -335,16 +325,27 @@ except Exception as e:
     st.error(f"Model load error: {e}")
     st.stop()
 
-# CAM 레이어 목록 구성 + 기본 선택을 conv4로
+# 2.5) CAM 레이어 목록 구성 + 기본 선택(권장: conv4_block24_concat)
 base = find_base_model(model)
 cam_layer_names = list_densenet_conv_names(base)
-default_index = 0
-for i, name in enumerate(cam_layer_names):
-    if "conv4_block" in name and "concat" in name:
-        default_index = i  # conv4를 기본값으로
-        break
+
+def _default_cam_index(names):
+    if "conv4_block24_concat" in names:
+        return names.index("conv4_block24_concat")
+    conv4 = [i for i, n in enumerate(names) if ("conv4_block" in n and "concat" in n)]
+    if conv4:
+        return conv4[-1]
+    conv5 = [i for i, n in enumerate(names) if ("conv5_block" in n and "concat" in n)]
+    if conv5:
+        return conv5[-1]
+    return len(names) - 1 if names else 0
+
+default_index = _default_cam_index(cam_layer_names)
+
 with st.sidebar:
     chosen_name = st.selectbox("Select CAM layer", cam_layer_names, index=default_index if cam_layer_names else 0)
+    with st.expander("🔧 Debug: Available 4D layers"):
+        st.write("\n".join(cam_layer_names))
 
 # 3) 예측 UI
 up = st.file_uploader("Upload an X-ray image (JPG/PNG)", type=["jpg", "jpeg", "png"])
@@ -368,7 +369,7 @@ if up is not None:
             p_pneu = predict_pneumonia_prob(model, x_raw_bchw)
             pred_label = CLASS_NAMES[1] if p_pneu >= thresh else CLASS_NAMES[0]
             conf = p_pneu if pred_label == "PNEUMONIA" else (1 - p_pneu)
-            target_class = 1 if (p_pneu >= thresh) else 0  # CAM도 같은 기준 사용
+            target_class = 1 if (p_pneu >= thresh) else 0  # CAM도 예측 클래스 기준
 
             # CAM 레이어 선택
             preferred = chosen_name if chosen_name else None
@@ -377,6 +378,14 @@ if up is not None:
             heatmap, method, note = make_gradcam_heatmap(
                 x_raw_bchw, model, conv_layer, target_class=target_class
             )
+
+            # 폴백 경고 표시
+            if method != "gradcam":
+                st.warning(
+                    "현재 Grad-CAM이 아니라 **Saliency 폴백**으로 표시되고 있습니다. "
+                    "사이드바에서 **실제로 존재하는 conv4_blockXX_concat** 레이어를 선택해 주세요. "
+                    f"(원인: {note or 'unknown'})"
+                )
 
             # === 폐 마스크 적용 ===
             if use_mask:
