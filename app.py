@@ -116,10 +116,10 @@ def _normalize_heatmap(x):
     mx = tf.reduce_max(x)
     return tf.where(mx > 0, x / mx, x)
 
-def make_gradcam_heatmap(img_preprocessed_bchw, model, last_conv_layer_name: str):
+def make_gradcam_heatmap(img_bchw, model, last_conv_layer_name: str):
     """
-    img_preprocessed_bchw: preprocessed, shape [1, H, W, 3]
-    Returns: heatmap [Hc, Wc]
+    img_bchw: 모델에 그대로 넣을 입력 (예: 0~255 float32, shape [1,H,W,3])
+    Returns: heatmap [Hc, Wc] as float32 (0~1)
     """
     base = find_base_model(model)
     try:
@@ -128,17 +128,22 @@ def make_gradcam_heatmap(img_preprocessed_bchw, model, last_conv_layer_name: str
         last_conv_layer_name = find_last_conv_name(base)
         last_conv = base.get_layer(last_conv_layer_name)
 
-    last_conv_model = keras.Model(model.input, last_conv.output)
+    # 한 그래프에서 conv출력과 최종출력을 동시에 얻는 모델
+    grad_model = keras.Model([model.inputs], [last_conv.output, model.output])
 
+    # 순전파 + 그래디언트
     with tf.GradientTape() as tape:
-        conv_out = last_conv_model(img_preprocessed_bchw)
+        conv_out, preds = grad_model(img_bchw, training=False)
+        # 출력 형태 자동 대응: (N,1) sigmoid or (N,2) softmax
+        if preds.shape[-1] == 1:
+            class_channel = preds[:, 0]   # 양성 점수
+        else:
+            class_channel = preds[:, 1]   # class 1 (PNEUMONIA)
         tape.watch(conv_out)
-        preds = model(img_preprocessed_bchw, training=False)
-        class_channel = preds[:, 0]  # class=1 (PNEUMONIA) score
 
-    grads = tape.gradient(class_channel, conv_out)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    conv_out = conv_out[0]  # [Hc, Wc, C]
+    grads = tape.gradient(class_channel, conv_out)          # d(score)/d(feature)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))    # GAP
+    conv_out = conv_out[0]                                  # [Hc, Wc, C]
     heatmap = tf.reduce_sum(conv_out * pooled_grads, axis=-1)
     heatmap = _normalize_heatmap(heatmap)
     return heatmap.numpy()
