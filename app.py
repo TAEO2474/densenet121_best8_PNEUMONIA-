@@ -220,7 +220,7 @@ if up is not None:
 
     colA, colB = st.columns([1, 1])
     with colA:
-        sst.image(rgb_uint8, caption="Input (Resized 224×224)", use_column_width=True)
+        st.image(rgb_uint8, caption="Input (Resized 224×224)", use_column_width=True)
 
     if st.button("Run inference"):
         with st.spinner("Running model..."):
