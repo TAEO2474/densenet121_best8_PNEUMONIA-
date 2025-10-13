@@ -89,18 +89,13 @@ def load_model(model_path: str):
 
 # ============================= Grad-CAM helpers =============================
 def find_last_conv4d_layer(model: keras.Model):
-    """
-    출력 rank==4 (B,H,W,C) 인 마지막 레이어를 반환.
-    conv/concat/relu로 이름 필터링하지 않고 '실제 4D 특징맵' 보장에 집중.
-    """
     last = None
     for lyr in model.layers:
         shp = getattr(lyr, "output_shape", None)
         if shp is None:
             continue
-        # multi-output 레이어일 수 있으므로 하나만 보정
+        # 다중 출력이면 첫 출력만 랭크 확인
         if isinstance(shp, (list, tuple)) and shp and isinstance(shp[0], (list, tuple)):
-            # shp가 [(None,H,W,C), ...] 같은 구조일 수 있음
             try:
                 rank = len(shp[0])
             except Exception:
@@ -121,25 +116,21 @@ def _normalize_heatmap(x):
     return tf.where(mx > 0, x / mx, x)
 
 def make_gradcam_heatmap(img_bchw, model: keras.Model, last_conv_layer_name: str = None):
-    """
-    img_bchw: 모델 입력과 동일 스케일/shape (float32, [1,H,W,3])
-    Returns: heatmap [Hc, Wc] (0~1 float32)
-    """
-    # 0) 입력 dtype 보정
-    img_bchw = tf.convert_to_tensor(img_bchw)
-    if img_bchw.dtype != tf.float32:
-        img_bchw = tf.cast(img_bchw, tf.float32)
+    # 0) 입력: numpy float32로 유지 (Keras가 내부에서 텐서화)
+    if not isinstance(img_bchw, np.ndarray):
+        img_bchw = np.array(img_bchw)
+    if img_bchw.dtype != np.float32:
+        img_bchw = img_bchw.astype(np.float32)
 
-    # 1) 마지막 4D conv 레이어 결정
+    # 1) 마지막 4D conv
     conv_layer = None
     if last_conv_layer_name:
         try:
             lyr = model.get_layer(last_conv_layer_name)
             shp = getattr(lyr, "output_shape", None)
-            try:
+            rank = None
+            if shp is not None:
                 rank = len(shp) if isinstance(shp, (list, tuple)) else len(tuple(shp))
-            except Exception:
-                rank = None
             if rank == 4:
                 conv_layer = lyr
         except Exception:
@@ -147,25 +138,25 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, last_conv_layer_name: str
     if conv_layer is None:
         conv_layer = find_last_conv4d_layer(model)
 
-    # 2) 같은 그래프에서 conv 출력과 최종 출력 동시 획득
-    grad_model = keras.Model([model.inputs], [conv_layer.output, model.output])
+    # 2) 같은 그래프에서 conv/출력 동시 획득 (model.input 사용, 리스트로 감싸지 않음)
+    grad_model = keras.Model(inputs=model.input, outputs=[conv_layer.output, model.output])
 
     # 3) 순전파 + 그래디언트
     with tf.GradientTape() as tape:
         conv_out, preds = grad_model(img_bchw, training=False)
 
-        # 리스트/딕셔너리/튜플 출력 정규화
-        def _to_tensor(x):
-            if isinstance(x, dict):
-                x = next(iter(x.values()))
-            if isinstance(x, (list, tuple)):
-                x = x[0]
-            return tf.convert_to_tensor(x)
-        conv_out = _to_tensor(conv_out)
-        preds    = _to_tensor(preds)
-        tape.watch(conv_out)
+        # 출력 정규화
+        if isinstance(preds, dict):
+            preds = next(iter(preds.values()))
+        if isinstance(preds, (list, tuple)):
+            preds = preds[0]
+        preds = tf.convert_to_tensor(preds)
 
-        # preds를 (N,C) 형태로 표준화
+        if isinstance(conv_out, (list, tuple)):
+            conv_out = conv_out[0]
+        conv_out = tf.convert_to_tensor(conv_out)
+
+        # (N,C)로 표준화
         if preds.shape.rank is None or preds.shape.rank == 0:
             preds = tf.reshape(preds, (-1, 1))
         elif preds.shape.rank == 1:
@@ -176,22 +167,17 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, last_conv_layer_name: str
 
     grads = tape.gradient(class_channel, conv_out)
     if grads is None:
-        raise RuntimeError(
-            "Gradients are None. 마지막 conv 레이어가 GAP/Flatten 이후거나 "
-            "모델이 미분 불가능한 경로일 수 있습니다."
-        )
+        raise RuntimeError("Gradients are None. 마지막 conv가 GAP/Flatten 이후거나 그래프가 끊겼습니다.")
 
-    # 동적 축 평균 (마지막 채널축 제외)
-    r = grads.shape.rank or tf.rank(grads)
-    if isinstance(r, tf.Tensor):  # 그래프 모드 안전
-        r = int(r.numpy())
-    axes = tuple(range(0, max(1, r - 1)))  # 채널축 제외 모두 평균
-    pooled_grads = tf.reduce_mean(grads, axis=axes)  # [C] 기대
+    # 동적 축 평균 (채널축 제외)
+    r = grads.shape.rank
+    axes = tuple(range(0, max(1, r - 1)))
+    pooled_grads = tf.reduce_mean(grads, axis=axes)
 
-    # conv_out: [N,Hc,Wc,C] 또는 [Hc,Wc,C] → [Hc,Wc,C]
+    # conv_out: [N,Hc,Wc,C] → [Hc,Wc,C]
     if conv_out.shape.rank == 4:
         conv_out = conv_out[0]
-    heatmap = tf.reduce_sum(conv_out * pooled_grads, axis=-1)  # [Hc,Wc]
+    heatmap = tf.reduce_sum(conv_out * pooled_grads, axis=-1)
     heatmap = _normalize_heatmap(heatmap)
     return heatmap.numpy()
 
