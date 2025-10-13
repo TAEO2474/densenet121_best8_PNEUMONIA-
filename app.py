@@ -74,73 +74,73 @@ def prepare_inputs(pil_img):
     return rgb_uint8, bchw_raw
 
 def predict_prob(model, bchw_raw):
-    prob = model(bchw_raw, training=False)  # 모델이 단일 입력일 때 위치 인자 호출 OK
+    """항상 이름-딕셔너리로만 호출해서 그래프 매핑 고정"""
+    input_name = model.inputs[0].name.split(":")[0]  # 보통 'input_image'
+    prob = model({input_name: bchw_raw}, training=False)  # ✅ dict only
     if isinstance(prob, (list, tuple)):
         prob = prob[0]
     return float(np.asarray(prob).squeeze())
 
+
 # ----------------------- Grad-CAM 본체 -----------------------
 def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class: int = 1):
+    """
+    Grad-CAM 생성. model/grad_model 모두 '입력이름 딕셔너리'로만 호출.
+    실패 시 SmoothGrad로 폴백하되, 그때도 딕셔너리만 사용.
+    """
     import numpy as np, tensorflow as tf, cv2
     from tensorflow import keras
 
     x = tf.convert_to_tensor(img_bchw, dtype=tf.float32)
-    input_name = model.inputs[0].name.split(":")[0]  # 보통 'input_image'
-
-    # 두 방식 모두 시도하는 헬퍼
-    def _call(fn, x):
-        try:
-            return fn(x, training=False)            # 위치 인자 우선
-        except Exception:
-            return fn({input_name: x}, training=False)  # dict(이름)로 재시도
+    input_name = model.inputs[0].name.split(":")[0]  # ex) 'input_image'
 
     try:
-        # 그래프 워밍업 (입력 형식 고정)
-        _ = _call(model, x)
+        # 그래프 워밍업도 dict만 사용
+        _ = model({input_name: x}, training=False)
 
-        # 중간출력 모델 구성
-        grad_model = keras.Model(inputs=model.inputs,
-                                 outputs=[conv_layer.output, model.output])
+        # 중간출력 모델
+        grad_model = keras.Model(
+            inputs=model.inputs,
+            outputs=[conv_layer.output, model.output]
+        )
 
         with tf.GradientTape() as tape:
-            conv_out, preds = _call(grad_model, x)
+            conv_out, preds = grad_model({input_name: x}, training=False)  # ✅ dict only
             tape.watch(conv_out)
 
             if isinstance(preds, (list, tuple)):
                 preds = preds[0]
+
             # 이진(sigmoid) vs 다중(softmax)
             if preds.shape[-1] == 1:
                 class_channel = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
             else:
                 class_channel = preds[:, target_class]
 
-        grads = tf.nn.relu(tf.cast(tf.gradients_function(lambda z: z)(class_channel, conv_out)
-                                   if hasattr(tf, "gradients_function") else
-                                   tf.gradients(class_channel, conv_out)[0], tf.float32))
-        if grads is None:
-            grads = tf.gradients(class_channel, conv_out)[0]
+        grads = tape.gradient(class_channel, conv_out)
         if grads is None or conv_out.shape.rank != 4:
             raise RuntimeError("no_grads_or_bad_rank")
 
         # 채널 가중치 평균 → CAM
-        weights = tf.reduce_mean(grads, axis=(0, 1, 2))            # [C]
-        cam = tf.reduce_sum(conv_out[0] * weights, axis=-1)        # [Hc,Wc]
+        grads = tf.nn.relu(grads)
+        weights = tf.reduce_mean(grads, axis=(0, 1, 2))   # [C]
+        cam = tf.reduce_sum(conv_out[0] * weights, axis=-1)
+
+        # 정규화 + 살짝 대비 + 은은한 블러
         cam = tf.maximum(cam, 0)
         cam = cam / (tf.reduce_max(cam) + 1e-8)
-
-        # 살짝 대비를 주고(90퍼센타일) 은은한 블러
         p90 = float(np.percentile(cam.numpy(), 90.0))
-        heat = np.clip(cam / (p90 + 1e-6), 0, 1).astype(np.float32)
+        heat = np.clip(cam.numpy() / (p90 + 1e-6), 0, 1).astype(np.float32)
         heat = cv2.GaussianBlur(heat, (3, 3), 0)
 
         return heat, "gradcam", ""
 
     except Exception as e:
-        # ---- SmoothGrad Saliency 폴백 ----
+        # ---- SmoothGrad Saliency 폴백 (여기도 dict만) ----
         note = f"gradcam_fallback({type(e).__name__})"
         with tf.GradientTape() as tape:
             tape.watch(x)
-            preds = _call(model, x)
+            preds = model({input_name: x}, training=False)  # ✅ dict only
             if isinstance(preds, (list, tuple)):
                 preds = preds[0]
             if preds.shape[-1] == 1:
@@ -152,6 +152,7 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
         heat = heat / (heat.max() + 1e-8)
         heat = cv2.GaussianBlur(heat.astype(np.float32), (3, 3), 0)
         return heat, "saliency", note
+
 
 
 # ----------------------- Sidebar -----------------------
