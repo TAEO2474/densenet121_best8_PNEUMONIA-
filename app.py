@@ -118,35 +118,41 @@ def _normalize_heatmap(x):
 
 def make_gradcam_heatmap(img_bchw, model, last_conv_layer_name: str):
     """
-    img_bchw: 모델에 그대로 넣을 입력 (예: 0~255 float32, shape [1,H,W,3])
-    Returns: heatmap [Hc, Wc] as float32 (0~1)
+    img_bchw: 모델에 그대로 넣는 입력 (예: 0~255 float32, shape [1,H,W,3])
+    Returns: heatmap [Hc, Wc] (0~1 float32)
     """
-    base = find_base_model(model)
+    # 1) top-level model에서 레이어를 바로 찾는다
     try:
-        last_conv = base.get_layer(last_conv_layer_name)
+        conv_layer = model.get_layer(last_conv_layer_name)
     except Exception:
-        last_conv_layer_name = find_last_conv_name(base)
-        last_conv = base.get_layer(last_conv_layer_name)
+        # 이름이 안 맞으면 전체 모델에서 마지막 Conv 계열 자동 탐색
+        candidates = []
+        for lyr in model.layers:
+            n = lyr.name.lower()
+            if ("conv" in n) or ("concat" in n) or ("relu" in n):
+                candidates.append(lyr)
+        conv_layer = candidates[-1] if candidates else model.layers[-1]
 
-    # 한 그래프에서 conv출력과 최종출력을 동시에 얻는 모델
-    grad_model = keras.Model([model.inputs], [last_conv.output, model.output])
+    # 2) 같은 그래프에서 conv 출력과 최종 출력을 동시에 얻는 서브 모델
+    grad_model = keras.Model([model.inputs], [conv_layer.output, model.output])
 
-    # 순전파 + 그래디언트
+    # 3) 순전파 + 그래디언트
     with tf.GradientTape() as tape:
         conv_out, preds = grad_model(img_bchw, training=False)
-        # 출력 형태 자동 대응: (N,1) sigmoid or (N,2) softmax
+        # 출력 형태 자동 대응: (N,1) sigmoid 또는 (N,2) softmax
         if preds.shape[-1] == 1:
-            class_channel = preds[:, 0]   # 양성 점수
+            class_channel = preds[:, 0]        # 양성 score
         else:
-            class_channel = preds[:, 1]   # class 1 (PNEUMONIA)
+            class_channel = preds[:, 1]        # class 1 (PNEUMONIA)
         tape.watch(conv_out)
 
-    grads = tape.gradient(class_channel, conv_out)          # d(score)/d(feature)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))    # GAP
-    conv_out = conv_out[0]                                  # [Hc, Wc, C]
+    grads = tape.gradient(class_channel, conv_out)           # d(score)/d(feature)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))     # GAP
+    conv_out = conv_out[0]                                   # [Hc, Wc, C]
     heatmap = tf.reduce_sum(conv_out * pooled_grads, axis=-1)
     heatmap = _normalize_heatmap(heatmap)
     return heatmap.numpy()
+
 
 def overlay_heatmap(rgb_uint8, heatmap, alpha=0.4):
     h, w = rgb_uint8.shape[:2]
@@ -233,9 +239,8 @@ if up is not None:
             pred_label = CLASS_NAMES[1] if p_pneu >= thresh else CLASS_NAMES[0]
             conf = p_pneu if pred_label == "PNEUMONIA" else (1 - p_pneu)
 
-            base = find_base_model(model)
-            last_layer_name = find_last_conv_name(base)
-            heatmap = make_gradcam_heatmap(x_pp_bchw, model, last_layer_name)
+            last_layer_name = find_last_conv_name(model) 
+            heatmap = make_gradcam_heatmap(x_raw_bchw, model, last_layer_name)
             cam_img = overlay_heatmap(rgb_uint8, heatmap, alpha=0.45)
 
         with colB:
