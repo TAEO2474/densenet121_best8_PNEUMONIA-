@@ -86,21 +86,11 @@ def list_4d_layers(model_or_layer):
     return [lyr for lyr in model_or_layer.layers if _is_4d(lyr)] if isinstance(model_or_layer, keras.Model) else []
 
 def list_densenet_conv_names(base: keras.Model):
-    """DenseNet 내부 4D conv 계열 레이어 이름 목록(사이드바 선택용)."""
     names = [l.name for l in base.layers if _is_4d(l)]
-    # 뒤쪽 블록들이 위로 오도록 살짝 정렬 힌트
     names.sort(key=lambda x: (x.count("block5") == 0, x))
     return names
 
 def get_densenet_feature_layer(base: keras.Model, preferred_name: str | None):
-    """
-    우선순위:
-      - 사용자가 고른 preferred_name (있고 4D면)
-      - conv5_block16_concat
-      - relu
-      - 이름에 concat/relu 포함된 4D
-      - 마지막 4D
-    """
     try:
         if preferred_name:
             lyr = base.get_layer(preferred_name)
@@ -148,12 +138,11 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer):
             conv_out = tf.convert_to_tensor(conv_out)
             tape.watch(conv_out)
 
-            # (N,C) 표준화
             if preds.shape.rank is None or preds.shape.rank == 0:
                 preds = tf.reshape(preds, (-1, 1))
             elif preds.shape.rank == 1:
                 preds = tf.expand_dims(preds, -1)
-            # Grad-CAM 논문 방식: 양의 그라디언트만 사용
+
             class_channel = preds[:, 0] if preds.shape[-1] == 1 else preds[:, 1]
 
         grads = tape.gradient(class_channel, conv_out)
@@ -164,8 +153,7 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer):
         weights = tf.reduce_mean(grads, axis=(0, 1, 2))  # [C]
         cam = tf.reduce_sum(conv_out[0] * weights, axis=-1)  # [Hc,Wc]
         heatmap = _normalize_heatmap(cam)
-        # 강조(감마) + 약간의 스무딩
-        heatmap = tf.pow(heatmap, 2.0)
+        heatmap = tf.pow(heatmap, 2.0)  # 감마 강조
         heatmap = tf.numpy_function(lambda m: cv2.GaussianBlur(m, (3, 3), 0), [heatmap], tf.float32)
         return np.clip(heatmap, 0.0, 1.0).astype(np.float32), "gradcam"
     except Exception:
@@ -196,12 +184,41 @@ def overlay_heatmap(rgb_uint8, heatmap, alpha=0.6):
     out = (jet * alpha + rgb_uint8 * (1 - alpha)).clip(0, 255).astype(np.uint8)
     return out
 
+# ========= Lung mask (ellipses) =========
+def lung_mask_ellipses(h, w, cy_ratio=0.48, rx_ratio=0.23, ry_ratio=0.32, gap_ratio=0.10):
+    """
+    간단 타원 2개로 좌/우 폐 영역 근사 마스크 생성.
+    파라미터는 사이드바에서 조정 가능.
+    """
+    mask = np.zeros((h, w), np.uint8)
+    cx = w // 2
+    cy = int(h * float(cy_ratio))
+    rx = int(w * float(rx_ratio))
+    ry = int(h * float(ry_ratio))
+    gap = int(w * float(gap_ratio))
+    left_center  = (cx - gap, cy)
+    right_center = (cx + gap, cy)
+    cv2.ellipse(mask, left_center,  (rx, ry), 0, 0, 360, 255, -1)
+    cv2.ellipse(mask, right_center, (rx, ry), 0, 0, 360, 255, -1)
+    return (mask > 0).astype(np.float32)
+
+def apply_lung_mask(heatmap, cy_ratio, rx_ratio, ry_ratio, gap_ratio, thr=None):
+    """
+    heatmap:[H,W] -> 타원 마스크를 곱하고(폐 바깥=0), 선택적으로 임계값 이하 컷(thr) 적용
+    """
+    h, w = heatmap.shape[:2]
+    m = lung_mask_ellipses(h, w, cy_ratio, rx_ratio, ry_ratio, gap_ratio)
+    masked = heatmap * m
+    if thr is not None:
+        masked = np.where(masked >= thr, masked, 0.0)
+    return masked
+
 # ============================= Inference =============================
 def prepare_inputs(pil_img: Image.Image):
     pil = pil_img.convert("RGB").resize(IMG_SIZE)
     arr = np.array(pil, dtype=np.uint8)
-    bchw_raw = np.expand_dims(arr.astype(np.float32), axis=0)  # 모델 입력 스케일
-    bchw_pp  = preprocess_input(bchw_raw.copy())               # (분석용)
+    bchw_raw = np.expand_dims(arr.astype(np.float32), axis=0)
+    bchw_pp  = preprocess_input(bchw_raw.copy())  # (분석용)
     return arr, bchw_raw, bchw_pp
 
 def predict_pneumonia_prob(model, bchw_raw):
@@ -220,7 +237,17 @@ with st.sidebar:
     st.divider()
     st.subheader("Grad-CAM layer")
     st.caption("기본: conv5_block16_concat (없으면 자동 폴백). 필요시 다른 블록으로 비교해 보세요.")
-    # 선택 가능한 레이어 목록은 모델 로드 후 채웁니다. (아래 본문에서 렌더)
+    # CAM 레이어 목록은 모델 로드 후 본문에서 채웁니다.
+
+    st.divider()
+    st.subheader("Lung mask (ellipses)")
+    use_mask = st.checkbox("Mask to lung area only", value=True)
+    with st.expander("Mask tuning (optional)"):
+        cy_ratio  = st.slider("center y (ratio)", 0.35, 0.60, 0.48, 0.01)
+        rx_ratio  = st.slider("radius x (ratio)", 0.15, 0.35, 0.23, 0.01)
+        ry_ratio  = st.slider("radius y (ratio)", 0.20, 0.45, 0.32, 0.01)
+        gap_ratio = st.slider("left/right gap (ratio)", 0.05, 0.20, 0.10, 0.01)
+        thr_cut   = st.slider("heatmap threshold", 0.00, 0.80, 0.30, 0.01)
 
     st.divider()
     st.subheader("Model fallback")
@@ -284,6 +311,18 @@ if up is not None:
             conv_layer = get_densenet_feature_layer(base, preferred)
 
             heatmap, method = make_gradcam_heatmap(x_raw_bchw, model, conv_layer)
+
+            # === 여기서 폐 마스크 적용 ===
+            if use_mask:
+                heatmap = apply_lung_mask(
+                    heatmap,
+                    cy_ratio=cy_ratio,
+                    rx_ratio=rx_ratio,
+                    ry_ratio=ry_ratio,
+                    gap_ratio=gap_ratio,
+                    thr=thr_cut,
+                )
+
             cam_img = overlay_heatmap(rgb_uint8, heatmap, alpha=0.6)
 
         with colB:
