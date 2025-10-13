@@ -1,6 +1,6 @@
 # ============================================================
 # app.py — Grad-CAM integrated Streamlit (DenseNet121)
-# Colab과 동일한 Grad-CAM 색감 / 구조로 표시
+# (입력이름 dict-only + 동일 입력텐서로 grad_model 구성)
 # ============================================================
 
 import os, cv2, numpy as np, streamlit as st, tensorflow as tf
@@ -74,43 +74,41 @@ def prepare_inputs(pil_img):
     return rgb_uint8, bchw_raw
 
 def predict_prob(model, bchw_raw):
-    # 모델의 실제 입력 텐서 & 이름을 직접 가져옴
+    """입력이름 딕셔너리로만 호출해 그래프 매핑 고정"""
     inp_tensor = model.get_layer("input_image").input
-    input_name = inp_tensor.name.split(":")[0]          # 'input_image'
-
-    # 반드시 dict only
-    prob = model({input_name: bchw_raw}, training=False)
+    input_name = inp_tensor.name.split(":")[0]  # 'input_image'
+    prob = model({input_name: bchw_raw}, training=False)  # ✅ dict only
     if isinstance(prob, (list, tuple)):
         prob = prob[0]
     return float(np.asarray(prob).squeeze())
 
-
 # ----------------------- Grad-CAM 본체 -----------------------
 def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class: int = 1):
+    """
+    Grad-CAM 생성. model/grad_model 모두 '입력이름 딕셔너리'로만 호출.
+    실패 시 SmoothGrad로 폴백하되, 그때도 딕셔너리만 사용.
+    """
     import numpy as np, tensorflow as tf, cv2
     from tensorflow import keras
 
     x = tf.convert_to_tensor(img_bchw, dtype=tf.float32)
-
-    # ✅ 메인 모델의 실제 입력 텐서 & 이름을 ‘직접’ 가져와 고정
     inp_tensor = model.get_layer("input_image").input
-    input_name = inp_tensor.name.split(":")[0]          # 'input_image'
+    input_name = inp_tensor.name.split(":")[0]  # ex) 'input_image'
 
     try:
         # 그래프 워밍업도 dict only
         _ = model({input_name: x}, training=False)
 
-        # ✅ 같은 입력 텐서로 서브모델 구성 (여기가 핵심)
+        # ✅ 같은 입력 텐서로 서브모델 구성 (핵심)
         grad_model = keras.Model(
             inputs=inp_tensor,
             outputs=[conv_layer.output, model.output]
         )
 
         with tf.GradientTape() as tape:
-            # ✅ dict only로 호출
+            # ✅ dict only 호출
             conv_out, preds = grad_model({input_name: x}, training=False)
             tape.watch(conv_out)
-
             if isinstance(preds, (list, tuple)):
                 preds = preds[0]
 
@@ -124,36 +122,37 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
         if grads is None or conv_out.shape.rank != 4:
             raise RuntimeError("no_grads_or_bad_rank")
 
+        # 채널 가중치 평균 → CAM
         grads = tf.nn.relu(grads)
-        weights = tf.reduce_mean(grads, axis=(0, 1, 2))
+        weights = tf.reduce_mean(grads, axis=(0, 1, 2))   # [C]
         cam = tf.reduce_sum(conv_out[0] * weights, axis=-1)
 
+        # 정규화 + 살짝 대비 + 은은한 블러
         cam = tf.maximum(cam, 0)
         cam = cam / (tf.reduce_max(cam) + 1e-8)
         p90 = float(np.percentile(cam.numpy(), 90.0))
         heat = np.clip(cam.numpy() / (p90 + 1e-6), 0, 1).astype(np.float32)
         heat = cv2.GaussianBlur(heat, (3, 3), 0)
+
         return heat, "gradcam", ""
 
     except Exception as e:
-        # ---- SmoothGrad fallback (여기도 dict only) ----
+        # ---- SmoothGrad Saliency 폴백 (여기도 dict only) ----
         note = f"gradcam_fallback({type(e).__name__})"
         with tf.GradientTape() as tape:
             tape.watch(x)
             preds = model({input_name: x}, training=False)
-            if isinstance(preds, (list, tuple)): preds = preds[0]
+            if isinstance(preds, (list, tuple)):
+                preds = preds[0]
             if preds.shape[-1] == 1:
                 class_channel = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
             else:
                 class_channel = preds[:, target_class]
-        g = tape.gradient(class_channel, x)
+        g = tape.gradient(class_channel, x)                 # [1,H,W,3]
         heat = tf.reduce_max(tf.abs(g), axis=-1)[0].numpy()
         heat = heat / (heat.max() + 1e-8)
         heat = cv2.GaussianBlur(heat.astype(np.float32), (3, 3), 0)
         return heat, "saliency", note
-
-
-
 
 # ----------------------- Sidebar -----------------------
 with st.sidebar:
@@ -198,16 +197,13 @@ if up and conv_layer is not None:
             label = "PNEUMONIA" if p_pneu >= thresh else "NORMAL"
             target_class = 1 if label == "PNEUMONIA" else 0
 
-            # 🔹 Grad-CAM 생성
             heatmap, method, note = make_gradcam_heatmap(x_raw_bchw, model, conv_layer, target_class)
 
-            # 🔹 폴백 여부 안내
             if method != "gradcam":
                 st.warning(f"지금은 Saliency 폴백입니다. (원인: {note})  → 다른 conv4 블록을 선택해 보세요.")
             else:
                 st.success(f"진짜 Grad-CAM 활성화됨 ({conv_layer.name})")
 
-            # 🔹 (선택) 폐 마스크 적용
             if use_mask:
                 h, w = heatmap.shape
                 mask = np.zeros((h, w), np.uint8)
