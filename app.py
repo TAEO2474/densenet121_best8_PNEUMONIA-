@@ -80,51 +80,67 @@ def predict_prob(model, bchw_raw):
     return float(np.asarray(prob).squeeze())
 
 # ----------------------- Grad-CAM 본체 -----------------------
-def make_gradcam_heatmap(img_bchw, model, conv_layer, target_class=1):
-    """
-    성공 시  : (heatmap, "gradcam", "")
-    폴백 시  : (heatmap, "saliency", "gradcam_fallback(<Err>)")
-    heatmap : float32 [0~1], shape=(Hc, Wc)
-    """
+def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class: int = 1):
+    import numpy as np, tensorflow as tf, cv2
+    from tensorflow import keras
+
     x = tf.convert_to_tensor(img_bchw, dtype=tf.float32)
-    grad_model = keras.Model(inputs=model.inputs, outputs=[conv_layer.output, model.output])
+    input_name = model.inputs[0].name.split(":")[0]  # 보통 'input_image'
+
+    # 두 방식 모두 시도하는 헬퍼
+    def _call(fn, x):
+        try:
+            return fn(x, training=False)            # 위치 인자 우선
+        except Exception:
+            return fn({input_name: x}, training=False)  # dict(이름)로 재시도
 
     try:
+        # 그래프 워밍업 (입력 형식 고정)
+        _ = _call(model, x)
+
+        # 중간출력 모델 구성
+        grad_model = keras.Model(inputs=model.inputs,
+                                 outputs=[conv_layer.output, model.output])
+
         with tf.GradientTape() as tape:
-            conv_out, preds = grad_model(x, training=False)
+            conv_out, preds = _call(grad_model, x)
             tape.watch(conv_out)
 
-            # 이진(sigmoid) vs 다중(softmax) 둘 다 처리
             if isinstance(preds, (list, tuple)):
                 preds = preds[0]
+            # 이진(sigmoid) vs 다중(softmax)
             if preds.shape[-1] == 1:
                 class_channel = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
             else:
                 class_channel = preds[:, target_class]
 
-        grads = tape.gradient(class_channel, conv_out)
+        grads = tf.nn.relu(tf.cast(tf.gradients_function(lambda z: z)(class_channel, conv_out)
+                                   if hasattr(tf, "gradients_function") else
+                                   tf.gradients(class_channel, conv_out)[0], tf.float32))
+        if grads is None:
+            grads = tf.gradients(class_channel, conv_out)[0]
         if grads is None or conv_out.shape.rank != 4:
             raise RuntimeError("no_grads_or_bad_rank")
 
-        # ReLU(grads) 가중치 평균 → 채널별 가중합
-        grads = tf.nn.relu(grads)
-        weights = tf.reduce_mean(grads, axis=(0, 1, 2))      # [C]
-        cam = tf.reduce_sum(conv_out[0] * weights, axis=-1)  # [Hc,Wc]
-
-        # 정규화 + 살짝 강도 보정(90퍼센타일 스케일) + 은은한 블러
+        # 채널 가중치 평균 → CAM
+        weights = tf.reduce_mean(grads, axis=(0, 1, 2))            # [C]
+        cam = tf.reduce_sum(conv_out[0] * weights, axis=-1)        # [Hc,Wc]
         cam = tf.maximum(cam, 0)
         cam = cam / (tf.reduce_max(cam) + 1e-8)
+
+        # 살짝 대비를 주고(90퍼센타일) 은은한 블러
         p90 = float(np.percentile(cam.numpy(), 90.0))
         heat = np.clip(cam / (p90 + 1e-6), 0, 1).astype(np.float32)
         heat = cv2.GaussianBlur(heat, (3, 3), 0)
+
         return heat, "gradcam", ""
 
     except Exception as e:
-        # -------- SmoothGrad Saliency 폴백 --------
+        # ---- SmoothGrad Saliency 폴백 ----
         note = f"gradcam_fallback({type(e).__name__})"
         with tf.GradientTape() as tape:
             tape.watch(x)
-            preds = model(x, training=False)
+            preds = _call(model, x)
             if isinstance(preds, (list, tuple)):
                 preds = preds[0]
             if preds.shape[-1] == 1:
@@ -132,10 +148,11 @@ def make_gradcam_heatmap(img_bchw, model, conv_layer, target_class=1):
             else:
                 class_channel = preds[:, target_class]
         g = tape.gradient(class_channel, x)                 # [1,H,W,3]
-        heat = tf.reduce_max(tf.abs(g), axis=-1)[0].numpy() # [H,W]
+        heat = tf.reduce_max(tf.abs(g), axis=-1)[0].numpy()
         heat = heat / (heat.max() + 1e-8)
         heat = cv2.GaussianBlur(heat.astype(np.float32), (3, 3), 0)
         return heat, "saliency", note
+
 
 # ----------------------- Sidebar -----------------------
 with st.sidebar:
