@@ -6,6 +6,7 @@ import streamlit as st
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras.applications.densenet import preprocess_input
+from tensorflow.keras import backend as K
 from PIL import Image
 import cv2
 import gdown
@@ -16,11 +17,13 @@ st.set_page_config(page_title="CXR Pneumonia Classifier (DenseNet121)", layout="
 CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 IMG_SIZE = (224, 224)
 
+# Google Drive FILE ID (Secrets 우선)
 FILE_ID = st.secrets.get("MODEL_FILE_ID", "1UPxtL1kx8a38z9fxlBRljNn8n6T4LL_l")
 MODEL_DIR = Path("models")
 MODEL_LOCAL = MODEL_DIR / "densenet121_best_9.keras"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
+# Drive 막힐 때 폴백 URL (HF/GitHub 등)
 HTTP_FALLBACK_URL = st.secrets.get("MODEL_DIRECT_URL", "")
 TIMEOUT = 120
 
@@ -75,18 +78,22 @@ def find_base_model(m: keras.Model):
                 return lyr
         return m
 
-def _rank_of_output_shape(shp):
+def _is_4d(layer) -> bool:
+    """K.int_shape로 안전하게 rank==4 판정."""
     try:
-        if shp is None:
-            return None
-        if isinstance(shp, (list, tuple)) and shp and isinstance(shp[0], (list, tuple)):
-            return len(shp[0])
-        return len(shp) if isinstance(shp, (list, tuple)) else len(tuple(shp))
+        shp = K.int_shape(layer.output)  # (None,H,W,C)
+        return (shp is not None) and (len(shp) == 4)
     except Exception:
-        return None
+        return False
+
+def list_4d_layers(model_or_layer):
+    """한 단계 자식 중 4D 출력 레이어 목록."""
+    if isinstance(model_or_layer, keras.Model):
+        return [lyr for lyr in model_or_layer.layers if _is_4d(lyr)]
+    return []
 
 def find_last_conv4d_layer_recursive(layer_or_model):
-    """모델 트리를 DFS로 훑어 마지막 4D(B,H,W,C) 출력 레이어를 반환."""
+    """모델 트리를 DFS로 훑어 마지막 4D(B,H,W,C) 레이어를 반환."""
     last = None
     if isinstance(layer_or_model, keras.Model):
         for lyr in layer_or_model.layers:
@@ -94,25 +101,18 @@ def find_last_conv4d_layer_recursive(layer_or_model):
             if cand is not None:
                 last = cand
     else:
-        rank = _rank_of_output_shape(getattr(layer_or_model, "output_shape", None))
-        if rank == 4:
+        if _is_4d(layer_or_model):
             last = layer_or_model
     return last
 
 def pick_best_densenet_conv_layer(base: keras.Model):
     """
-    DenseNet 서브모델 내부에서 4D 출력 레이어 중
-    이름에 'concat' 또는 'relu'가 포함된 가장 마지막 레이어를 우선 선택.
-    없으면 단순히 마지막 4D 레이어 반환.
+    DenseNet 내부 4D 레이어 중 이름에 'concat'/'relu' 포함 레이어를 우선.
+    없으면 마지막 4D 레이어.
     """
-    four_d_layers = []
-    for lyr in base.layers:
-        r = _rank_of_output_shape(getattr(lyr, "output_shape", None))
-        if r == 4:
-            four_d_layers.append(lyr)
+    four_d_layers = list_4d_layers(base)
     if not four_d_layers:
         return None
-    # 우선순위: concat/relu가 이름에 포함된 레이어
     preferred = [l for l in four_d_layers if ("concat" in l.name.lower()) or ("relu" in l.name.lower())]
     return (preferred[-1] if preferred else four_d_layers[-1])
 
@@ -124,20 +124,19 @@ def _normalize_heatmap(x):
 
 def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer):
     """
-    conv_layer: 실제 레이어 객체(서브모델 내부 포함)
+    conv_layer: 레이어 '객체' (서브모델 내부 포함)
     img_bchw: float32, [1,H,W,3]
     """
-    # 입력 numpy 보장
+    # 입력은 numpy float32 유지 (Keras가 내부에서 텐서화)
     if not isinstance(img_bchw, np.ndarray):
         img_bchw = np.array(img_bchw)
     if img_bchw.dtype != np.float32:
         img_bchw = img_bchw.astype(np.float32)
 
-    # 안전가드
     if conv_layer is None or not hasattr(conv_layer, "output"):
         raise ValueError("유효한 4D conv 레이어를 찾지 못했습니다.")
 
-    # 같은 그래프에서 conv/최종 출력 동시 획득
+    # 동일 그래프에서 conv/최종 출력 동시 획득
     grad_model = keras.Model(inputs=model.input, outputs=[conv_layer.output, model.output])
 
     with tf.GradientTape() as tape:
@@ -161,6 +160,7 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer):
         elif preds.shape.rank == 1:
             preds = tf.expand_dims(preds, -1)
 
+        # sigmoid(1) vs softmax(2+)
         class_channel = preds[:, 0] if preds.shape[-1] == 1 else preds[:, 1]
 
     grads = tape.gradient(class_channel, conv_out)
@@ -191,8 +191,8 @@ def overlay_heatmap(rgb_uint8, heatmap, alpha=0.4):
 def prepare_inputs(pil_img: Image.Image):
     pil = pil_img.convert("RGB").resize(IMG_SIZE)
     arr = np.array(pil, dtype=np.uint8)
-    bchw_raw = np.expand_dims(arr.astype(np.float32), axis=0)
-    bchw_pp  = preprocess_input(bchw_raw.copy())  # 분석용(모델 입력은 raw 사용)
+    bchw_raw = np.expand_dims(arr.astype(np.float32), axis=0)  # 모델 입력과 동일 스케일
+    bchw_pp  = preprocess_input(bchw_raw.copy())               # 분석용
     return arr, bchw_raw, bchw_pp
 
 def predict_pneumonia_prob(model, bchw_raw):
@@ -255,11 +255,17 @@ if up is not None:
 
     if st.button("Run inference"):
         with st.spinner("Running model..."):
+            # ------------------ 빌드 ------------------
+            # 먼저 한 번 호출해 그래프/shape를 확정(빌드)한다.
+            _ = model(x_raw_bchw, training=False)
+
+            # 예측
             p_pneu = predict_pneumonia_prob(model, x_raw_bchw)
             pred_label = CLASS_NAMES[1] if p_pneu >= thresh else CLASS_NAMES[0]
             conf = p_pneu if pred_label == "PNEUMONIA" else (1 - p_pneu)
 
-            # DenseNet 서브모델에서 '진짜 4D conv' 선택
+            # ------------------ 선택 ------------------
+            # DenseNet 서브모델에서 '진짜 4D conv' 레이어를 고른다.
             base = find_base_model(model)
             conv_layer = pick_best_densenet_conv_layer(base)
             if conv_layer is None:
@@ -272,8 +278,9 @@ if up is not None:
                 st.stop()
 
             last_layer_name = conv_layer.name
-            st.write("last conv:", last_layer_name)  # 디버그용
+            st.write("last conv:", last_layer_name)  # 디버그용 (원하면 제거)
 
+            # ------------------ 실행 ------------------
             heatmap = make_gradcam_heatmap(x_raw_bchw, model, conv_layer)
             cam_img = overlay_heatmap(rgb_uint8, heatmap, alpha=0.45)
 
