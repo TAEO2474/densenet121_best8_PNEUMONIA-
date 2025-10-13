@@ -275,6 +275,8 @@ if up is not None:
             # Grad-CAM: 마지막 4D conv 이름/레이어 확보 후 동일 입력으로 계산
             last_conv_layer = find_last_conv4d_layer(model)
             last_layer_name = last_conv_layer.name
+            # 👇 디버깅용
+            st.write("last conv:", last_layer_name)
             heatmap = make_gradcam_heatmap(x_raw_bchw, model, last_layer_name)
             cam_img = overlay_heatmap(rgb_uint8, heatmap, alpha=0.45)
 
