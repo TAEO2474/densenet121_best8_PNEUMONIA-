@@ -140,17 +140,17 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
 
             if preds.shape.rank is None or preds.shape.rank == 0:
                 preds = tf.reshape(preds, (-1, 1))
-            elif preds.shape.rank == 1:
+            el
                 preds = tf.expand_dims(preds, -1)
 
-            # (N,C) 표준화 ...
+           if preds.shape.rank == 1:
+                preds = preds[None, :]
+
+            # 이진(sigmoid) vs 다중(softmax) 타깃 선택
             if preds.shape[-1] == 1:
-                # sigmoid 이진: target_class==1(폐렴)이면 p, 0(정상)이면 (1-p)
                 class_channel = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
             else:
-                # softmax 다중: 예측(또는 지정) 클래스 인덱스 사용
                 class_channel = preds[:, target_class]
-
 
         grads = tape.gradient(class_channel, conv_out)
         if grads is None or conv_out.shape.rank != 4:
@@ -161,7 +161,7 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
         cam = tf.reduce_sum(conv_out[0] * weights, axis=-1)  # [Hc,Wc]
         heatmap = _normalize_heatmap(cam)
         # 대비 강화: 상위 퍼센타일로 스케일링
-        p99 = tfp = tf.experimental.numpy.percentile(heatmap, 99.0)
+        p99 = float(np.percentile(heatmap.numpy(), 99.0))
         heatmap = tf.clip_by_value(heatmap / (p99 + 1e-6), 0.0, 1.0)
         heatmap = tf.pow(heatmap, 2.0)  # 감마 강조
         heatmap = tf.numpy_function(lambda m: cv2.GaussianBlur(m, (3, 3), 0), [heatmap], tf.float32)
@@ -175,7 +175,7 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
             if isinstance(preds, dict): preds = next(iter(preds.values()))
             if isinstance(preds, (list, tuple)): preds = preds[0]
             preds = tf.convert_to_tensor(preds)
-            if preds.shape.rank == 1:
+            
                 preds = preds[None, :]
             if preds.shape[-1] == 1:
             class_channel = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
