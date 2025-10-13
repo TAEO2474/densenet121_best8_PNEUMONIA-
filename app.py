@@ -121,11 +121,11 @@ def make_gradcam_heatmap(img_bchw, model, last_conv_layer_name: str):
     img_bchw: 모델에 그대로 넣는 입력 (예: 0~255 float32, shape [1,H,W,3])
     Returns: heatmap [Hc, Wc] (0~1 float32)
     """
-    # 1) top-level model에서 레이어를 바로 찾는다
+    # 1) 마지막 conv 레이어를 top-level model에서 찾기
     try:
         conv_layer = model.get_layer(last_conv_layer_name)
     except Exception:
-        # 이름이 안 맞으면 전체 모델에서 마지막 Conv 계열 자동 탐색
+        # 이름 매칭 실패 시 conv/concat/relu 계열 마지막 레이어 자동 선택
         candidates = []
         for lyr in model.layers:
             n = lyr.name.lower()
@@ -133,18 +133,35 @@ def make_gradcam_heatmap(img_bchw, model, last_conv_layer_name: str):
                 candidates.append(lyr)
         conv_layer = candidates[-1] if candidates else model.layers[-1]
 
-    # 2) 같은 그래프에서 conv 출력과 최종 출력을 동시에 얻는 서브 모델
+    # 2) 같은 그래프에서 conv 출력과 최종 출력 동시 획득
     grad_model = keras.Model([model.inputs], [conv_layer.output, model.output])
 
-    # 3) 순전파 + 그래디언트
+    # 3) 보조: 리스트/딕셔너리/넘파이 등 어떤 형태든 텐서로 통일
+    def _to_tensor(x):
+        if isinstance(x, dict):
+            # 첫 value 사용
+            x = next(iter(x.values()))
+        if isinstance(x, (list, tuple)):
+            x = x[0]
+        return tf.convert_to_tensor(x)
+
     with tf.GradientTape() as tape:
         conv_out, preds = grad_model(img_bchw, training=False)
-        # 출력 형태 자동 대응: (N,1) sigmoid 또는 (N,2) softmax
-        if preds.shape[-1] == 1:
-            class_channel = preds[:, 0]        # 양성 score
-        else:
-            class_channel = preds[:, 1]        # class 1 (PNEUMONIA)
+        conv_out = _to_tensor(conv_out)
+        preds    = _to_tensor(preds)
         tape.watch(conv_out)
+
+        # 출력 형태 안전 처리: (N,1) sigmoid or (N,2+) softmax or 스칼라 등
+        # rank 미지정/스칼라 대비
+        if preds.shape.rank is None or preds.shape.rank == 0:
+            preds = tf.reshape(preds, (-1, 1))
+        if preds.shape.rank == 1:
+            preds = tf.expand_dims(preds, -1)
+
+        if preds.shape[-1] == 1:
+            class_channel = preds[:, 0]          # 양성 score (sigmoid)
+        else:
+            class_channel = preds[:, 1]          # class 1 = PNEUMONIA (softmax)
 
     grads = tape.gradient(class_channel, conv_out)           # d(score)/d(feature)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))     # GAP
