@@ -19,7 +19,7 @@ CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 IMG_SIZE = (224, 224)
 
 # ▶▶ Put your Google Drive FILE ID here (NO underscore)
-FILE_ID = "1t9rkQ6_gFte9xFZwTHne2hZPH2MGTNg"   # ← 본인 ID (언더바 X)
+FILE_ID = "1UPxtL1kx8a38z9fxlBRljNn8n6T4LL_l"   # ← 본인 ID (언더바 X)
 
 MODEL_DIR = Path("models")
 MODEL_LOCAL = MODEL_DIR / "densenet121_best_9.keras"
