@@ -88,26 +88,39 @@ def load_model(model_path: str):
     return model
 
 # ============================= Grad-CAM helpers =============================
-def find_last_conv4d_layer(model: keras.Model):
+def find_base_model(m: keras.Model):
+    """DenseNet 백본(서브모델)을 찾아 반환. 없으면 전체 모델 반환."""
+    try:
+        return m.get_layer("densenet121")
+    except Exception:
+        for lyr in m.layers[::-1]:
+            if isinstance(lyr, keras.Model):
+                return lyr
+        return m
+
+def find_last_conv4d_layer_recursive(layer_or_model):
+    """
+    레이어/모델 트리를 DFS로 훑어 마지막으로 만난 rank==4(B,H,W,C) 출력 레이어를 반환.
+    서브모델 내부(conv/concat 등)까지 내려가서 '진짜 4D 특징맵'을 찾는다.
+    """
     last = None
-    for lyr in model.layers:
-        shp = getattr(lyr, "output_shape", None)
-        if shp is None:
-            continue
-        # 다중 출력이면 첫 출력만 랭크 확인
-        if isinstance(shp, (list, tuple)) and shp and isinstance(shp[0], (list, tuple)):
-            try:
+    if isinstance(layer_or_model, keras.Model):
+        for lyr in layer_or_model.layers:
+            cand = find_last_conv4d_layer_recursive(lyr)
+            if cand is not None:
+                last = cand
+    else:
+        shp = getattr(layer_or_model, "output_shape", None)
+        try:
+            if isinstance(shp, (list, tuple)) and shp and isinstance(shp[0], (list, tuple)):
                 rank = len(shp[0])
-            except Exception:
-                continue
-        else:
-            try:
-                rank = len(shp) if isinstance(shp, (list, tuple)) else len(tuple(shp))
-            except Exception:
-                continue
+            else:
+                rank = len(shp) if isinstance(shp, (list, tuple)) else len(tuple(shp)) if shp is not None else None
+        except Exception:
+            rank = None
         if rank == 4:
-            last = lyr
-    return last or model.layers[-1]
+            last = layer_or_model
+    return last
 
 @tf.function
 def _normalize_heatmap(x):
@@ -115,33 +128,21 @@ def _normalize_heatmap(x):
     mx = tf.reduce_max(x)
     return tf.where(mx > 0, x / mx, x)
 
-def make_gradcam_heatmap(img_bchw, model: keras.Model, last_conv_layer_name: str = None):
-    # 0) 입력: numpy float32로 유지 (Keras가 내부에서 텐서화)
+def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer):
+    """
+    conv_layer: '이름' 문자열이 아니라 실제 레이어 객체(서브모델 내부 레이어 포함)
+    img_bchw: 모델 입력과 동일 스케일/shape (float32, [1,H,W,3])
+    Returns: heatmap [Hc, Wc] (0~1 float32)
+    """
+    # 입력은 numpy float32 유지 (Keras가 내부에서 텐서화)
     if not isinstance(img_bchw, np.ndarray):
         img_bchw = np.array(img_bchw)
     if img_bchw.dtype != np.float32:
         img_bchw = img_bchw.astype(np.float32)
 
-    # 1) 마지막 4D conv
-    conv_layer = None
-    if last_conv_layer_name:
-        try:
-            lyr = model.get_layer(last_conv_layer_name)
-            shp = getattr(lyr, "output_shape", None)
-            rank = None
-            if shp is not None:
-                rank = len(shp) if isinstance(shp, (list, tuple)) else len(tuple(shp))
-            if rank == 4:
-                conv_layer = lyr
-        except Exception:
-            conv_layer = None
-    if conv_layer is None:
-        conv_layer = find_last_conv4d_layer(model)
-
-    # 2) 같은 그래프에서 conv/출력 동시 획득 (model.input 사용, 리스트로 감싸지 않음)
+    # 같은 그래프에서 conv 출력과 최종 출력 동시 획득
     grad_model = keras.Model(inputs=model.input, outputs=[conv_layer.output, model.output])
 
-    # 3) 순전파 + 그래디언트
     with tf.GradientTape() as tape:
         conv_out, preds = grad_model(img_bchw, training=False)
 
@@ -155,6 +156,7 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, last_conv_layer_name: str
         if isinstance(conv_out, (list, tuple)):
             conv_out = conv_out[0]
         conv_out = tf.convert_to_tensor(conv_out)
+        tape.watch(conv_out)
 
         # (N,C)로 표준화
         if preds.shape.rank is None or preds.shape.rank == 0:
@@ -167,9 +169,9 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, last_conv_layer_name: str
 
     grads = tape.gradient(class_channel, conv_out)
     if grads is None:
-        raise RuntimeError("Gradients are None. 마지막 conv가 GAP/Flatten 이후거나 그래프가 끊겼습니다.")
+        raise RuntimeError("Gradients are None. 선택된 conv 레이어가 올바르지 않거나 그래프가 끊겼습니다.")
 
-    # 동적 축 평균 (채널축 제외)
+    # 채널축 제외 평균
     r = grads.shape.rank
     axes = tuple(range(0, max(1, r - 1)))
     pooled_grads = tf.reduce_mean(grads, axis=axes)
@@ -194,8 +196,7 @@ def overlay_heatmap(rgb_uint8, heatmap, alpha=0.4):
 def prepare_inputs(pil_img: Image.Image):
     """
     Return (img_uint8_rgb, bchw_raw, bchw_preprocessed)
-    - 모델 내부에 preprocess Lambda가 있을 수 있으므로
-      추론은 bchw_raw(0~255 float32) 사용.
+    - 모델 내부에 preprocess Lambda가 있을 수 있으므로 추론은 bchw_raw(0~255 float32) 사용.
     - Grad-CAM도 모델 입력과 동일 텐서를 사용해야 그래프 불일치가 없다.
     """
     pil = pil_img.convert("RGB").resize(IMG_SIZE)
@@ -272,12 +273,16 @@ if up is not None:
             pred_label = CLASS_NAMES[1] if p_pneu >= thresh else CLASS_NAMES[0]
             conf = p_pneu if pred_label == "PNEUMONIA" else (1 - p_pneu)
 
-            # Grad-CAM: 마지막 4D conv 이름/레이어 확보 후 동일 입력으로 계산
-            last_conv_layer = find_last_conv4d_layer(model)
-            last_layer_name = last_conv_layer.name
-            # 👇 디버깅용
-            st.write("last conv:", last_layer_name)
-            heatmap = make_gradcam_heatmap(x_raw_bchw, model, last_layer_name)
+            # Grad-CAM: DenseNet 서브모델에서 '진짜 4D conv' 레이어 객체를 재귀로 찾기
+            base = find_base_model(model)  # 'densenet121' 서브모델
+            conv_layer = find_last_conv4d_layer_recursive(base)
+            if conv_layer is None:
+                # fallback: 전체 모델에서라도 4D conv 탐색
+                conv_layer = find_last_conv4d_layer_recursive(model)
+            last_layer_name = conv_layer.name if conv_layer is not None else "N/A"
+            st.write("last conv:", last_layer_name)  # 디버그용, 필요시 제거 가능
+
+            heatmap = make_gradcam_heatmap(x_raw_bchw, model, conv_layer)
             cam_img = overlay_heatmap(rgb_uint8, heatmap, alpha=0.45)
 
         with colB:
