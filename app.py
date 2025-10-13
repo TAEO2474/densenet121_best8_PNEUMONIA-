@@ -109,59 +109,90 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
         img_bchw = np.array(img_bchw, dtype=np.float32)
     if img_bchw.dtype != np.float32:
         img_bchw = img_bchw.astype(np.float32)
+
+    feed = {'input_image': img_bchw}  # ★ 핵심: 이름으로 피드
+
     try:
         grad_model = keras.Model(inputs=model.input, outputs=[conv_layer.output, model.output])
-        _ = model.predict(img_bchw, verbose=0)
+
+        # 예열
+        _ = model.predict(feed, verbose=0)
+
         with tf.GradientTape() as tape:
-            conv_out, preds = grad_model(img_bchw, training=False)
+            conv_out, preds = grad_model(feed, training=False)
+
             if isinstance(preds, dict):
                 preds = next(iter(preds.values()))
             if isinstance(preds, (list, tuple)):
                 preds = preds[0]
             preds = tf.convert_to_tensor(preds)
+
             if isinstance(conv_out, (list, tuple)):
                 conv_out = conv_out[0]
             conv_out = tf.convert_to_tensor(conv_out)
             tape.watch(conv_out)
-            if preds.shape.rank == 1:
+
+            if preds.shape.rank is None or preds.shape.rank == 0:
+                preds = tf.reshape(preds, (-1, 1))
+            elif preds.shape.rank == 1:
                 preds = tf.expand_dims(preds, -1)
+
             if preds.shape[-1] == 1:
                 class_channel = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
             else:
                 class_channel = preds[:, target_class]
+
         grads = tape.gradient(class_channel, conv_out)
         if grads is None or conv_out.shape.rank != 4:
             raise RuntimeError("no_grads_or_bad_rank")
+
         grads = tf.nn.relu(grads)
         weights = tf.reduce_mean(grads, axis=(0, 1, 2))
         cam = tf.reduce_sum(conv_out[0] * weights, axis=-1)
+
         cam = tf.where(tf.math.is_finite(cam), cam, 0.0)
         heat = tf.maximum(cam, 0.0)
-        heat /= (tf.reduce_max(heat) + 1e-8)
+        heat = heat / (tf.reduce_max(heat) + 1e-8)
+
         p95 = float(np.percentile(heat.numpy(), 95.0))
         heat = tf.clip_by_value(heat / (p95 + 1e-6), 0.0, 1.0)
-        heat_np = _gaussian_blur(heat.numpy().astype(np.float32), kmin=3)
-        return np.clip(heat_np, 0.0, 1.0), "gradcam", ""
+
+        heat_np = cv2.GaussianBlur(heat.numpy().astype(np.float32),
+                                   (max(3, (min(*heat.shape) // 4) | 1),) * 2, 0)
+        return np.clip(heat_np, 0.0, 1.0).astype(np.float32), "gradcam", ""
+
     except Exception as e:
         note = f"gradcam_fallback({type(e).__name__})"
-    # fallback (saliency)
+
+    # --- SmoothGrad fallback ---
     x = tf.convert_to_tensor(img_bchw)
-    acc = 0
-    for _ in range(12):
-        noise = tf.random.normal(shape=tf.shape(x), stddev=0.1 * 255.0)
+    N, sigma = 12, 0.10
+    acc = None
+    for _ in range(N):
+        noise = tf.random.normal(shape=tf.shape(x), stddev=sigma * 255.0)
         xn = tf.clip_by_value(x + noise, 0.0, 255.0)
         with tf.GradientTape() as tape:
             tape.watch(xn)
-            preds = model(xn, training=False)
-            if isinstance(preds, (list, tuple)):
-                preds = preds[0]
-        g = tape.gradient(preds, xn)
+            preds = model({'input_image': xn}, training=False)   # ★
+            if isinstance(preds, dict): preds = next(iter(preds.values()))
+            if isinstance(preds, (list, tuple)): preds = preds[0]
+            preds = tf.convert_to_tensor(preds)
+            if preds.shape.rank == 1: preds = preds[None, :]
+            if preds.shape[-1] == 1:
+                class_channel = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
+            else:
+                class_channel = preds[:, target_class]
+        g = tape.gradient(class_channel, xn)
         g = tf.reduce_max(tf.abs(g), axis=-1)[0]
-        acc += g
-    sal = acc / 12.0
-    sal /= (tf.reduce_max(sal) + 1e-8)
-    sal_np = np.power(_gaussian_blur(sal.numpy().astype(np.float32), 3), 1.2)
-    return np.clip(sal_np, 0.0, 1.0), "saliency", note
+        acc = g if acc is None else (acc + g)
+
+    sal = acc / float(N)
+    sal = sal / (tf.reduce_max(sal) + 1e-8)
+    k = max(3, (min(*sal.shape) // 4) | 1)
+    sal_np = cv2.GaussianBlur(sal.numpy().astype(np.float32), (k, k), 0)
+    sal_np = np.power(np.clip(sal_np, 0.0, 1.0), 1.2)
+    return sal_np.astype(np.float32), "saliency", note
+
 
 def overlay_heatmap(rgb_uint8, heatmap, alpha=0.6):
     h, w = rgb_uint8.shape[:2]
@@ -180,10 +211,11 @@ def prepare_inputs(pil_img: Image.Image):
     return arr, bchw_raw, bchw_pp
 
 def predict_pneumonia_prob(model, bchw_raw):
-    prob = model.predict(bchw_raw, verbose=0)
-    if isinstance(prob, (list, tuple)):
-        prob = prob[0]
+    prob = model.predict({'input_image': bchw_raw}, verbose=0)  # ★
+    if isinstance(prob, dict): prob = next(iter(prob.values()))
+    if isinstance(prob, (list, tuple)): prob = prob[0]
     return float(np.asarray(prob).squeeze())
+
 
 # ============================= Sidebar =============================
 with st.sidebar:
