@@ -127,65 +127,115 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer):
     conv_layer: 레이어 '객체' (서브모델 내부 포함)
     img_bchw: float32, [1,H,W,3]
     """
-    # 입력을 numpy float32로 보장 (Keras가 내부에서 텐서화)
+    # 입력 보장
     if not isinstance(img_bchw, np.ndarray):
         img_bchw = np.array(img_bchw)
     if img_bchw.dtype != np.float32:
         img_bchw = img_bchw.astype(np.float32)
 
-    # 안전가드
     if conv_layer is None or not hasattr(conv_layer, "output"):
         raise ValueError("유효한 4D conv 레이어를 찾지 못했습니다.")
 
-    # ❶ 중간특징 전용 서브모델과 최종모델을 '따로' 호출 (그래프 충돌 방지)
-    last_conv_model = keras.Model(inputs=model.input, outputs=conv_layer.output)
+    # ---------- 방법 A: 서브모델 2번 호출 (가장 표준) ----------
+    try:
+        last_conv_model = keras.Model(inputs=model.input, outputs=conv_layer.output)
+        with tf.GradientTape() as tape:
+            conv_out = last_conv_model(img_bchw, training=False)      # [N,Hc,Wc,C]
+            preds    = model(img_bchw,        training=False)          # [N,1] or [N,C]
 
-    with tf.GradientTape() as tape:
-        # 같은 Tape 안에서 같은 입력으로 각각 forward
-        conv_out = last_conv_model(img_bchw, training=False)  # [N,Hc,Wc,C]
-        preds    = model(img_bchw,        training=False)      # [N,1] 또는 [N,C]
+            if isinstance(preds, dict): preds = next(iter(preds.values()))
+            if isinstance(preds, (list, tuple)): preds = preds[0]
+            preds = tf.convert_to_tensor(preds)
 
-        # 리스트/딕셔너리 등 정규화
-        if isinstance(preds, dict):
-            preds = next(iter(preds.values()))
-        if isinstance(preds, (list, tuple)):
-            preds = preds[0]
-        preds = tf.convert_to_tensor(preds)
+            if isinstance(conv_out, (list, tuple)): conv_out = conv_out[0]
+            conv_out = tf.convert_to_tensor(conv_out)
+            tape.watch(conv_out)
 
-        if isinstance(conv_out, (list, tuple)):
-            conv_out = conv_out[0]
-        conv_out = tf.convert_to_tensor(conv_out)
+            # (N,C) 표준화
+            if preds.shape.rank is None or preds.shape.rank == 0:
+                preds = tf.reshape(preds, (-1, 1))
+            elif preds.shape.rank == 1:
+                preds = tf.expand_dims(preds, -1)
 
-        # conv_out은 변수 아닌 중간텐서이므로 watch 필요
-        tape.watch(conv_out)
+            class_channel = preds[:, 0] if preds.shape[-1] == 1 else preds[:, 1]
 
-        # (N,C) 표준화
-        if preds.shape.rank is None or preds.shape.rank == 0:
-            preds = tf.reshape(preds, (-1, 1))
-        elif preds.shape.rank == 1:
-            preds = tf.expand_dims(preds, -1)
+        grads = tape.gradient(class_channel, conv_out)
+        if grads is None:
+            raise RuntimeError("Gradients are None in method A.")
 
-        # 이진(sigmoid) vs 다중(softmax)
+        if conv_out.shape.rank != 4:
+            raise RuntimeError(f"Conv rank != 4 in method A: {conv_out.shape}")
+
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))  # [C]
+        conv_out = conv_out[0]                                # [Hc,Wc,C]
+        heatmap = tf.reduce_sum(conv_out * pooled_grads, axis=-1)
+        return _normalize_heatmap(heatmap).numpy()
+    except Exception as e_a:
+        # st.warning(f"Grad-CAM A failed: {e_a}")
+        pass
+
+    # ---------- 방법 B: K.function 경로 (그래프 매칭 문제 우회) ----------
+    try:
+        # 학습/추론 모드 분기 없는 모델이면 learning_phase 필요 없음
+        try:
+            fetch_fn = K.function([model.input], [conv_layer.output, model.output])
+            conv_out, preds = fetch_fn([img_bchw])
+        except Exception:
+            # 일부 환경에선 learning_phase가 필요
+            fetch_fn = K.function([model.input, K.learning_phase()],
+                                  [conv_layer.output, model.output])
+            conv_out, preds = fetch_fn([img_bchw, 0])
+
+        conv_out = np.asarray(conv_out)
+        preds    = np.asarray(preds)
+
+        if conv_out.ndim != 4:
+            raise RuntimeError(f"Conv rank != 4 in method B: {conv_out.shape}")
+
+        if preds.ndim == 0:
+            preds = preds.reshape(1, 1)
+        elif preds.ndim == 1:
+            preds = preds[:, None]
+
         class_channel = preds[:, 0] if preds.shape[-1] == 1 else preds[:, 1]
 
-    # ❷ d(class_score)/d(conv_out)
-    grads = tape.gradient(class_channel, conv_out)
-    if grads is None:
-        raise RuntimeError("Gradients are None. 선택된 conv 레이어가 올바르지 않거나 그래프가 끊겼습니다.")
+        # numpy로 그라디언트 못 구하므로, 간단한 CAM 가중치 근사 (채널별 GAP 가중)
+        # -> 방법 B에서는 실제 그라디언트를 못 쓰니, 채널별 평균 활성으로 근사
+        weights = conv_out.mean(axis=(1, 2), keepdims=False)[0]  # [C]
+        fmap    = conv_out[0]                                    # [Hc,Wc,C]
+        heatmap = np.tensordot(fmap, weights, axes=([2], [0]))  # [Hc,Wc]
+        # 클래스 스코어의 부호를 반영 (양성일수록 강조)
+        if class_channel.ndim:
+            sign = 1.0 if float(class_channel.squeeze()) >= 0 else -1.0
+            heatmap *= sign
+        heatmap = np.maximum(heatmap, 0.0)
+        mx = heatmap.max()
+        if mx > 0:
+            heatmap = heatmap / mx
+        return heatmap.astype(np.float32)
+    except Exception as e_b:
+        # st.warning(f"Grad-CAM B failed: {e_b}")
+        pass
 
-    # 유효성 보정: conv_out이 [N,Hc,Wc,C]가 아니면 시도 중단
-    if conv_out.shape.rank != 4:
-        raise RuntimeError(f"선택된 레이어 출력 rank가 4가 아닙니다: {conv_out.shape}")
-
-    # 채널축 제외 평균 (0:N,1:Hc,2:Wc)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))  # [C]
-
-    # [Hc,Wc,C]
-    conv_out = conv_out[0]
-    heatmap = tf.reduce_sum(conv_out * pooled_grads, axis=-1)  # [Hc,Wc]
-    heatmap = _normalize_heatmap(heatmap)
-    return heatmap.numpy()
-
+    # ---------- 방법 C: Saliency(입력-그래디언트) 폴백 ----------
+    # conv 레이어가 어떤 이유로든 연결 안될 때라도, 입력에 대한 민감도로 히트맵을 보여준다.
+    try:
+        x = tf.convert_to_tensor(img_bchw)
+        with tf.GradientTape() as tape:
+            tape.watch(x)
+            preds = model(x, training=False)
+            if isinstance(preds, dict): preds = next(iter(preds.values()))
+            if isinstance(preds, (list, tuple)): preds = preds[0]
+            preds = tf.convert_to_tensor(preds)
+            if preds.shape.rank == 1:
+                preds = preds[None, :]
+            class_channel = preds[:, 0] if preds.shape[-1] == 1 else preds[:, 1]
+        grads = tape.gradient(class_channel, x)  # [1,H,W,3]
+        sal = tf.reduce_max(tf.abs(grads), axis=-1)[0]  # [H,W]
+        sal = sal / (tf.reduce_max(sal) + 1e-8)
+        return sal.numpy().astype(np.float32)
+    except Exception as e_c:
+        raise RuntimeError(f"Grad-CAM and saliency fallback all failed: {e_c}")
 
 def overlay_heatmap(rgb_uint8, heatmap, alpha=0.4):
     h, w = rgb_uint8.shape[:2]
