@@ -127,9 +127,10 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
     if img_bchw.dtype != np.float32:
         img_bchw = img_bchw.astype(np.float32)
 
-    # A) 표준 Grad-CAM
+    # A) 표준 Grad-CAM  ✅ 교체본
     try:
-        grad_model = keras.Model(inputs=model.input, outputs=[conv_layer.output, model.output])
+        grad_model = keras.Model(inputs=model.input,
+                                 outputs=[conv_layer.output, model.output])
         with tf.GradientTape() as tape:
             conv_out, preds = grad_model(img_bchw, training=False)
 
@@ -139,42 +140,41 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
             if isinstance(preds, (list, tuple)):
                 preds = preds[0]
             preds = tf.convert_to_tensor(preds)
-
+    
             if isinstance(conv_out, (list, tuple)):
                 conv_out = conv_out[0]
             conv_out = tf.convert_to_tensor(conv_out)
             tape.watch(conv_out)
-
-            # (N, C) 형태로 맞추기
+    
+            # (N, C)로 맞추기
             if preds.shape.rank is None or preds.shape.rank == 0:
                 preds = tf.reshape(preds, (-1, 1))
             elif preds.shape.rank == 1:
                 preds = tf.expand_dims(preds, -1)
-
+    
             # 이진(sigmoid) vs 다중(softmax)
             if preds.shape[-1] == 1:
-                # target_class==1(폐렴) → p, 0(정상) → 1-p
                 class_channel = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
             else:
                 class_channel = preds[:, target_class]
 
-        grads = tape.gradient(class_channel, conv_out)
-        if grads is None or conv_out.shape.rank != 4:
-            raise RuntimeError("Grad-CAM path failed")
+    grads = tape.gradient(class_channel, conv_out)
+    if grads is None or conv_out.shape.rank != 4:
+        raise RuntimeError("Grad-CAM path failed")
 
-        # 양의 영향만 반영 + 채널별 가중치
-        grads = tf.nn.relu(grads)
-        weights = tf.reduce_mean(grads, axis=(0, 1, 2))          # [C]
-        cam = tf.reduce_sum(conv_out[0] * weights, axis=-1)      # [Hc, Wc]
+    # 채널 가중치 → CAM
+    grads = tf.nn.relu(grads)
+    weights = tf.reduce_mean(grads, axis=(0, 1, 2))     # [C]
+    cam = tf.reduce_sum(conv_out[0] * weights, axis=-1) # [Hc, Wc]
 
-        # 정규화 + 대비 강화
-        heatmap = _normalize_heatmap(cam)
-        p99 = float(np.percentile(heatmap.numpy(), 99.0))
-        heatmap = tf.clip_by_value(heatmap / (p99 + 1e-6), 0.0, 1.0)
-        heatmap = tf.pow(heatmap, 2.0)
-        heatmap = tf.numpy_function(lambda m: cv2.GaussianBlur(m, (3, 3), 0), [heatmap], tf.float32)
+    # ▶ 순한 정규화: min-max만 (퍼센타일/감마/블러 제거)
+    cam = tf.where(tf.math.is_finite(cam), cam, 0.0)
+    cmin = tf.reduce_min(cam)
+    cmax = tf.reduce_max(cam)
+    heatmap = tf.where(cmax > cmin, (cam - cmin) / (cmax - cmin + 1e-8), tf.zeros_like(cam))
 
-        return np.clip(heatmap, 0.0, 1.0).astype(np.float32), "gradcam"
+    return heatmap.numpy().astype(np.float32), "gradcam"
+
 
     except Exception:
         # B) 폴백: 입력-그라디언트 살리언시
@@ -336,8 +336,9 @@ if up is not None:
 
             p_pneu = predict_pneumonia_prob(model, x_raw_bchw)
             pred_label = CLASS_NAMES[1] if p_pneu >= thresh else CLASS_NAMES[0]
-            conf = p_pneu if pred_label == "PNEUMONIA" else (1 - p_pneu)
-            target_class = 1 if p_pneu >= 0.5 else 0
+            conf = p_pneu if pred_label == "PNEUMONIA" else (1 - p_pneu)            
+            # CAM도 같은 채널로
+            target_class = 1 if (p_pneu >= thresh) else 0
 
             # CAM 레이어 선택
             preferred = None if chosen_name.startswith("(auto)") else chosen_name
