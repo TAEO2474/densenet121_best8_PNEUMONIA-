@@ -359,7 +359,12 @@ if up is not None:
 
     if st.button("Run inference"):
         with st.spinner("Running model..."):
-            _ = model(x_raw_bchw, training=False)  # 그래프 빌드 고정
+            try:
+                _ = model.predict(x_raw_bchw, verbose=0)  # 내부에서 그래프/shape가 고정됨
+            except Exception:
+                # 혹시 predict도 막히면 텐서로 변환해 마지막 시도
+                x_tensor = tf.convert_to_tensor(x_raw_bchw, dtype=tf.float32)
+                _ = model(x_tensor, training=False)
 
             p_pneu = predict_pneumonia_prob(model, x_raw_bchw)
             pred_label = CLASS_NAMES[1] if p_pneu >= thresh else CLASS_NAMES[0]
