@@ -1,18 +1,10 @@
-# UI
 streamlit==1.38.0
-
-# ML/Core
 tensorflow-cpu==2.20.0
-# keras 핀은 제거 (TF 2.20이 자동으로 호환 버전 설치)
-# keras>=3.10.0  # ← 굳이 고정할 필요 없음. 고정하면 이 줄로.
-
-# 수치/이미지
 numpy==2.2.2
 opencv-python-headless==4.12.0.88
 pillow==10.4.0
-
-# 기타
 gdown==5.2.0
+requests>=2.31.0
 
 
 
