@@ -146,17 +146,27 @@ if up:
             label = "PNEUMONIA" if p_pneu >= thresh else "NORMAL"
             target_class = 1 if label == "PNEUMONIA" else 0
 
-            heatmap = make_gradcam_heatmap(x_raw_bchw, model, conv_layer, target_class)
-
+           # 🔹 Grad-CAM 생성
+            heatmap, method, note = make_gradcam_heatmap(x_raw_bchw, model, conv_layer, target_class)
+    
+            # 🔹 진짜 Grad-CAM / 폴백 여부 표시
+            if method != "gradcam":
+                st.warning(f"⚠️ 현재는 Saliency fallback입니다. (원인: {note})  👉 다른 conv4 블록을 선택해 보세요.")
+            else:
+                st.success(f"✅ 진짜 Grad-CAM 활성화됨 ({conv_layer.name})")
+    
+            # 🔹 이후 기존 코드 계속 실행
             if use_mask:
                 h, w = heatmap.shape
                 mask = np.zeros((h, w), np.uint8)
                 cx, cy = w // 2, int(h * cy_ratio)
                 rx, ry = int(w * rx_ratio), int(h * ry_ratio)
                 gap = int(w * gap_ratio)
-                cv2.ellipse(mask, (cx-gap, cy), (rx, ry), 0, 0, 360, 255, -1)
-                cv2.ellipse(mask, (cx+gap, cy), (rx, ry), 0, 0, 360, 255, -1)
+                cv2.ellipse(mask, (cx - gap, cy), (rx, ry), 0, 0, 360, 255, -1)
+                cv2.ellipse(mask, (cx + gap, cy), (rx, ry), 0, 0, 360, 255, -1)
                 heatmap *= (mask > 0).astype(np.float32)
+
+            
 
             cam_img = overlay_heatmap(rgb_uint8, heatmap)
         col1, col2 = st.columns(2)
