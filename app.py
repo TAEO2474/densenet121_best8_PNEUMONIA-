@@ -117,7 +117,7 @@ def _normalize_heatmap(x):
     mx = tf.reduce_max(x)
     return tf.where(mx > 0, x / (mx + 1e-8), x)
 
-def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer):
+def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class: int = 1):
     """
     반환: (heatmap [Hc,Wc] float32(0~1), method 'gradcam' | 'saliency')
     """
@@ -143,7 +143,14 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer):
             elif preds.shape.rank == 1:
                 preds = tf.expand_dims(preds, -1)
 
-            class_channel = preds[:, 0] if preds.shape[-1] == 1 else preds[:, 1]
+            # (N,C) 표준화 ...
+            if preds.shape[-1] == 1:
+                # sigmoid 이진: target_class==1(폐렴)이면 p, 0(정상)이면 (1-p)
+                class_channel = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
+            else:
+                # softmax 다중: 예측(또는 지정) 클래스 인덱스 사용
+                class_channel = preds[:, target_class]
+
 
         grads = tape.gradient(class_channel, conv_out)
         if grads is None or conv_out.shape.rank != 4:
@@ -153,6 +160,9 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer):
         weights = tf.reduce_mean(grads, axis=(0, 1, 2))  # [C]
         cam = tf.reduce_sum(conv_out[0] * weights, axis=-1)  # [Hc,Wc]
         heatmap = _normalize_heatmap(cam)
+        # 대비 강화: 상위 퍼센타일로 스케일링
+        p99 = tfp = tf.experimental.numpy.percentile(heatmap, 99.0)
+        heatmap = tf.clip_by_value(heatmap / (p99 + 1e-6), 0.0, 1.0)
         heatmap = tf.pow(heatmap, 2.0)  # 감마 강조
         heatmap = tf.numpy_function(lambda m: cv2.GaussianBlur(m, (3, 3), 0), [heatmap], tf.float32)
         return np.clip(heatmap, 0.0, 1.0).astype(np.float32), "gradcam"
@@ -167,7 +177,11 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer):
             preds = tf.convert_to_tensor(preds)
             if preds.shape.rank == 1:
                 preds = preds[None, :]
-            class_channel = preds[:, 0] if preds.shape[-1] == 1 else preds[:, 1]
+            if preds.shape[-1] == 1:
+            class_channel = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
+            else:
+            class_channel = preds[:, target_class]
+
         grads = tape.gradient(class_channel, x)  # [1,H,W,3]
         sal = tf.reduce_max(tf.abs(grads), axis=-1)[0]
         sal = sal / (tf.reduce_max(sal) + 1e-8)
@@ -305,12 +319,13 @@ if up is not None:
             p_pneu = predict_pneumonia_prob(model, x_raw_bchw)
             pred_label = CLASS_NAMES[1] if p_pneu >= thresh else CLASS_NAMES[0]
             conf = p_pneu if pred_label == "PNEUMONIA" else (1 - p_pneu)
+            target_class = 1 if p_pneu >= 0.5 else 0
 
             # CAM 레이어 선택
             preferred = None if chosen_name.startswith("(auto)") else chosen_name
             conv_layer = get_densenet_feature_layer(base, preferred)
 
-            heatmap, method = make_gradcam_heatmap(x_raw_bchw, model, conv_layer)
+            heatmap, method = make_gradcam_heatmap(x_raw_bchw, model, conv_layer, target_class=target_class)
 
             # === 여기서 폐 마스크 적용 ===
             if use_mask:
