@@ -121,6 +121,7 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
     """
     반환: (heatmap [Hc,Wc] float32(0~1), method 'gradcam' | 'saliency')
     """
+    # 입력 타입 보정
     if not isinstance(img_bchw, np.ndarray):
         img_bchw = np.array(img_bchw, dtype=np.float32)
     if img_bchw.dtype != np.float32:
@@ -131,56 +132,80 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer, target_class:
         grad_model = keras.Model(inputs=model.input, outputs=[conv_layer.output, model.output])
         with tf.GradientTape() as tape:
             conv_out, preds = grad_model(img_bchw, training=False)
-            if isinstance(preds, dict): preds = next(iter(preds.values()))
-            if isinstance(preds, (list, tuple)): preds = preds[0]
+
+            # preds / conv_out 정규화
+            if isinstance(preds, dict):
+                preds = next(iter(preds.values()))
+            if isinstance(preds, (list, tuple)):
+                preds = preds[0]
             preds = tf.convert_to_tensor(preds)
-            if isinstance(conv_out, (list, tuple)): conv_out = conv_out[0]
+
+            if isinstance(conv_out, (list, tuple)):
+                conv_out = conv_out[0]
             conv_out = tf.convert_to_tensor(conv_out)
             tape.watch(conv_out)
 
-            # (N,C) 표준화 ...
+            # (N, C) 형태로 맞추기
+            if preds.shape.rank is None or preds.shape.rank == 0:
+                preds = tf.reshape(preds, (-1, 1))
+            elif preds.shape.rank == 1:
+                preds = tf.expand_dims(preds, -1)
+
+            # 이진(sigmoid) vs 다중(softmax)
             if preds.shape[-1] == 1:
-                # sigmoid 이진: target_class==1(폐렴)이면 p, 0(정상)이면 (1-p)
+                # target_class==1(폐렴) → p, 0(정상) → 1-p
                 class_channel = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
             else:
-                # softmax 다중: 예측(또는 지정) 클래스 인덱스 사용
                 class_channel = preds[:, target_class]
-                    grads = tape.gradient(class_channel, conv_out)
-                    if grads is None or conv_out.shape.rank != 4:
-                        raise RuntimeError("Grad-CAM path failed")
 
-        grads = tf.nn.relu(grads)  # 양의 영향만
-        weights = tf.reduce_mean(grads, axis=(0, 1, 2))  # [C]
-        cam = tf.reduce_sum(conv_out[0] * weights, axis=-1)  # [Hc,Wc]
+        grads = tape.gradient(class_channel, conv_out)
+        if grads is None or conv_out.shape.rank != 4:
+            raise RuntimeError("Grad-CAM path failed")
+
+        # 양의 영향만 반영 + 채널별 가중치
+        grads = tf.nn.relu(grads)
+        weights = tf.reduce_mean(grads, axis=(0, 1, 2))          # [C]
+        cam = tf.reduce_sum(conv_out[0] * weights, axis=-1)      # [Hc, Wc]
+
+        # 정규화 + 대비 강화
         heatmap = _normalize_heatmap(cam)
-        # 대비 강화: 상위 퍼센타일로 스케일링
         p99 = float(np.percentile(heatmap.numpy(), 99.0))
         heatmap = tf.clip_by_value(heatmap / (p99 + 1e-6), 0.0, 1.0)
-        heatmap = tf.pow(heatmap, 2.0)  # 감마 강조
+        heatmap = tf.pow(heatmap, 2.0)
         heatmap = tf.numpy_function(lambda m: cv2.GaussianBlur(m, (3, 3), 0), [heatmap], tf.float32)
+
         return np.clip(heatmap, 0.0, 1.0).astype(np.float32), "gradcam"
+
     except Exception:
         # B) 폴백: 입력-그라디언트 살리언시
         x = tf.convert_to_tensor(img_bchw)
         with tf.GradientTape() as tape:
             tape.watch(x)
             preds = model(x, training=False)
-            if isinstance(preds, dict): preds = next(iter(preds.values()))
-            if isinstance(preds, (list, tuple)): preds = preds[0]
-            preds = tf.convert_to_tensor(preds)
-            
-                preds = preds[None, :]
-            if preds.shape[-1] == 1:
-            class_channel = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
-            else:
-            class_channel = preds[:, target_class]
 
-        grads = tape.gradient(class_channel, x)  # [1,H,W,3]
-        sal = tf.reduce_max(tf.abs(grads), axis=-1)[0]
+            if isinstance(preds, dict):
+                preds = next(iter(preds.values()))
+            if isinstance(preds, (list, tuple)):
+                preds = preds[0]
+            preds = tf.convert_to_tensor(preds)
+
+            # (N, C) 형태로 맞추기
+            if preds.shape.rank == 1:
+                preds = preds[None, :]
+
+            if preds.shape[-1] == 1:
+                class_channel = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
+            else:
+                class_channel = preds[:, target_class]
+
+        grads = tape.gradient(class_channel, x)   # [1, H, W, 3]
+        sal = tf.reduce_max(tf.abs(grads), axis=-1)[0]   # [H, W]
         sal = sal / (tf.reduce_max(sal) + 1e-8)
         sal = tf.pow(sal, 1.5)
         sal = tf.numpy_function(lambda m: cv2.GaussianBlur(m, (3, 3), 0), [sal], tf.float32)
+
         return np.clip(sal, 0.0, 1.0).astype(np.float32), "saliency"
+
 
 def overlay_heatmap(rgb_uint8, heatmap, alpha=0.6):
     h, w = rgb_uint8.shape[:2]
