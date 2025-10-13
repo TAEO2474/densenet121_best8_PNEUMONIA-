@@ -220,7 +220,7 @@ if up is not None:
 
     colA, colB = st.columns([1, 1])
     with colA:
-        st.image(rgb_uint8, caption="Input (Resized 224×224)", use_container_width=True)
+        sst.image(rgb_uint8, caption="Input (Resized 224×224)", use_column_width=True)
 
     if st.button("Run inference"):
         with st.spinner("Running model..."):
@@ -234,7 +234,7 @@ if up is not None:
             cam_img = overlay_heatmap(rgb_uint8, heatmap, alpha=0.45)
 
         with colB:
-            st.image(cam_img, caption=f"Grad-CAM (last: {last_layer_name})", use_container_width=True)
+            st.image(cam_img, caption=f"Grad-CAM (last: {last_layer_name})", use_column_width=True)
 
         st.subheader("Prediction")
         col1, col2, col3 = st.columns(3)
