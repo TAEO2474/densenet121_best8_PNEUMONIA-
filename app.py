@@ -122,10 +122,12 @@ def _normalize_heatmap(x):
     mx = tf.reduce_max(x)
     return tf.where(mx > 0, x / mx, x)
 
+# ---------- 새 폴백 포함 Grad-CAM ----------
 def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer):
     """
     conv_layer: 레이어 '객체' (서브모델 내부 포함)
     img_bchw: float32, [1,H,W,3]
+    A→B→C 폴백으로 무조건 히트맵을 반환.
     """
     # 입력 보장
     if not isinstance(img_bchw, np.ndarray):
@@ -136,7 +138,7 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer):
     if conv_layer is None or not hasattr(conv_layer, "output"):
         raise ValueError("유효한 4D conv 레이어를 찾지 못했습니다.")
 
-    # ---------- 방법 A: 서브모델 2번 호출 (가장 표준) ----------
+    # ---------- 방법 A: 서브모델 2번 호출 (표준) ----------
     try:
         last_conv_model = keras.Model(inputs=model.input, outputs=conv_layer.output)
         with tf.GradientTape() as tape:
@@ -170,18 +172,15 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer):
         conv_out = conv_out[0]                                # [Hc,Wc,C]
         heatmap = tf.reduce_sum(conv_out * pooled_grads, axis=-1)
         return _normalize_heatmap(heatmap).numpy()
-    except Exception as e_a:
-        # st.warning(f"Grad-CAM A failed: {e_a}")
-        pass
+    except Exception:
+        pass  # A 실패 → B 시도
 
     # ---------- 방법 B: K.function 경로 (그래프 매칭 문제 우회) ----------
     try:
-        # 학습/추론 모드 분기 없는 모델이면 learning_phase 필요 없음
         try:
             fetch_fn = K.function([model.input], [conv_layer.output, model.output])
             conv_out, preds = fetch_fn([img_bchw])
         except Exception:
-            # 일부 환경에선 learning_phase가 필요
             fetch_fn = K.function([model.input, K.learning_phase()],
                                   [conv_layer.output, model.output])
             conv_out, preds = fetch_fn([img_bchw, 0])
@@ -197,45 +196,33 @@ def make_gradcam_heatmap(img_bchw, model: keras.Model, conv_layer):
         elif preds.ndim == 1:
             preds = preds[:, None]
 
-        class_channel = preds[:, 0] if preds.shape[-1] == 1 else preds[:, 1]
-
-        # numpy로 그라디언트 못 구하므로, 간단한 CAM 가중치 근사 (채널별 GAP 가중)
-        # -> 방법 B에서는 실제 그라디언트를 못 쓰니, 채널별 평균 활성으로 근사
+        # 채널 평균 활성으로 근사 가중치
         weights = conv_out.mean(axis=(1, 2), keepdims=False)[0]  # [C]
         fmap    = conv_out[0]                                    # [Hc,Wc,C]
-        heatmap = np.tensordot(fmap, weights, axes=([2], [0]))  # [Hc,Wc]
-        # 클래스 스코어의 부호를 반영 (양성일수록 강조)
-        if class_channel.ndim:
-            sign = 1.0 if float(class_channel.squeeze()) >= 0 else -1.0
-            heatmap *= sign
+        heatmap = np.tensordot(fmap, weights, axes=([2], [0]))   # [Hc,Wc]
         heatmap = np.maximum(heatmap, 0.0)
         mx = heatmap.max()
         if mx > 0:
             heatmap = heatmap / mx
         return heatmap.astype(np.float32)
-    except Exception as e_b:
-        # st.warning(f"Grad-CAM B failed: {e_b}")
-        pass
+    except Exception:
+        pass  # B 실패 → C 시도
 
     # ---------- 방법 C: Saliency(입력-그래디언트) 폴백 ----------
-    # conv 레이어가 어떤 이유로든 연결 안될 때라도, 입력에 대한 민감도로 히트맵을 보여준다.
-    try:
-        x = tf.convert_to_tensor(img_bchw)
-        with tf.GradientTape() as tape:
-            tape.watch(x)
-            preds = model(x, training=False)
-            if isinstance(preds, dict): preds = next(iter(preds.values()))
-            if isinstance(preds, (list, tuple)): preds = preds[0]
-            preds = tf.convert_to_tensor(preds)
-            if preds.shape.rank == 1:
-                preds = preds[None, :]
-            class_channel = preds[:, 0] if preds.shape[-1] == 1 else preds[:, 1]
-        grads = tape.gradient(class_channel, x)  # [1,H,W,3]
-        sal = tf.reduce_max(tf.abs(grads), axis=-1)[0]  # [H,W]
-        sal = sal / (tf.reduce_max(sal) + 1e-8)
-        return sal.numpy().astype(np.float32)
-    except Exception as e_c:
-        raise RuntimeError(f"Grad-CAM and saliency fallback all failed: {e_c}")
+    x = tf.convert_to_tensor(img_bchw)
+    with tf.GradientTape() as tape:
+        tape.watch(x)
+        preds = model(x, training=False)
+        if isinstance(preds, dict): preds = next(iter(preds.values()))
+        if isinstance(preds, (list, tuple)): preds = preds[0]
+        preds = tf.convert_to_tensor(preds)
+        if preds.shape.rank == 1:
+            preds = preds[None, :]
+        class_channel = preds[:, 0] if preds.shape[-1] == 1 else preds[:, 1]
+    grads = tape.gradient(class_channel, x)  # [1,H,W,3]
+    sal = tf.reduce_max(tf.abs(grads), axis=-1)[0]  # [H,W]
+    sal = sal / (tf.reduce_max(sal) + 1e-8)
+    return sal.numpy().astype(np.float32)
 
 def overlay_heatmap(rgb_uint8, heatmap, alpha=0.4):
     h, w = rgb_uint8.shape[:2]
@@ -314,8 +301,7 @@ if up is not None:
 
     if st.button("Run inference"):
         with st.spinner("Running model..."):
-            # ------------------ 빌드 ------------------
-            # 먼저 한 번 호출해 그래프/shape를 확정(빌드)한다.
+            # 모델 한 번 호출해 그래프/shape 고정(빌드)
             _ = model(x_raw_bchw, training=False)
 
             # 예측
@@ -323,8 +309,7 @@ if up is not None:
             pred_label = CLASS_NAMES[1] if p_pneu >= thresh else CLASS_NAMES[0]
             conf = p_pneu if pred_label == "PNEUMONIA" else (1 - p_pneu)
 
-            # ------------------ 선택 ------------------
-            # DenseNet 서브모델에서 '진짜 4D conv' 레이어를 고른다.
+            # DenseNet 서브모델에서 4D conv 선택
             base = find_base_model(model)
             conv_layer = pick_best_densenet_conv_layer(base)
             if conv_layer is None:
@@ -332,19 +317,14 @@ if up is not None:
             if conv_layer is None:
                 conv_layer = find_last_conv4d_layer_recursive(model)
 
-            if conv_layer is None:
-                st.error("4D conv 레이어를 찾지 못했습니다. 모델 구조를 확인해 주세요.")
-                st.stop()
+            # (선택) 디버그용: 필요 시 잠깐만 켜세요
+            # st.write("last conv:", conv_layer.name if conv_layer else "None")
 
-            last_layer_name = conv_layer.name
-            st.write("conv shape:", tf.convert_to_tensor(keras.Model(model.input, conv_layer.output)(x_raw_bchw)).shape) # 디버그용 (원하면 제거)
-
-            # ------------------ 실행 ------------------
             heatmap = make_gradcam_heatmap(x_raw_bchw, model, conv_layer)
             cam_img = overlay_heatmap(rgb_uint8, heatmap, alpha=0.45)
 
         with colB:
-            st.image(cam_img, caption=f"Grad-CAM (last: {last_layer_name})", use_column_width=True)
+            st.image(cam_img, caption="Grad-CAM / Saliency (auto-fallback)", use_column_width=True)
 
         st.subheader("Prediction")
         col1, col2, col3 = st.columns(3)
