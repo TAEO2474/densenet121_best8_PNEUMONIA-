@@ -1,5 +1,5 @@
 # ============================================================
-# app.py — DenseNet121_BinaryClassifier 전용, 확실하게 동작하는 분리형 Grad-CAM
+# app.py — DenseNet121_BinaryClassifier 전용, 확실하게 동작하는 분리형 Grad-CAM (Any Layer)
 # ============================================================
 
 import os
@@ -92,54 +92,32 @@ def ellipse_lung_mask(h, w, cy=0.48, rx=0.23, ry=0.32, gap=0.10):
     cv2.ellipse(mask, (cx + gap, cy), (rx, ry), 0, 0, 360, 255, -1)
     return (mask > 0).astype(np.float32)
 
-# ----------------------- 분리형 Grad-CAM 빌더 -----------------------
-def build_feature_and_head(model: keras.Model, last_conv_name: str):
-    preprocess_layer = model.get_layer("densenet_preprocess")
-    base             = model.get_layer("densenet121")
+# ----------------------- Grad-CAM (원본 그래프 사용, Any Layer) -----------------------
+def gradcam_from_any_layer(img_bchw: np.ndarray, model: keras.Model, target_layer_name: str, target_class: int = 1):
+    """
+    모델 전체 그래프를 그대로 사용해:
+      - target_layer_name의 feature map
+      - 최종 출력(model.output)
+    을 한 번의 순전파로 받아 Grad-CAM을 계산한다.
+    => 중간 레이어 채널 수가 헤드 기대치와 달라도 안전.
+    """
+    base = model.get_layer("densenet121")
+    target_tensor = base.get_layer(target_layer_name).output  # 예: 'relu' or 'conv3_block9_concat' 등
+    cam_model = keras.Model(inputs=model.input, outputs=[target_tensor, model.output])
 
-    # DenseNet 내부 서브모델: base.input -> last_conv.output
-    last_conv_tensor_inner = base.get_layer(last_conv_name).output
-    feat_inner = keras.Model(base.input, last_conv_tensor_inner, name="feat_inner")
-
-    # 새 입력으로 완전 새 경로 구성 (기존 심볼릭 텐서 재사용 금지!)
-    cam_input = keras.Input(shape=model.input_shape[1:], name="cam_input")
-    z = preprocess_layer(cam_input)
-    z = feat_inner(z)
-    feature_extractor = keras.Model(cam_input, z, name="feature_extractor")
-
-    # densenet121 이후 헤드 재사용 (GAP/Dropout/Dense)
-    head_input = keras.Input(shape=z.shape[1:], name="cam_head_in")
-    x = head_input
-    passed = False
-    for lyr in model.layers:
-        if lyr.name == "densenet121":
-            passed = True
-            continue
-        if not passed:
-            continue
-        x = lyr(x)
-    classifier_head = keras.Model(head_input, x, name="classifier_head")
-    return feature_extractor, classifier_head
-
-# ----------------------- Grad-CAM (분리형) -----------------------
-def gradcam_separated(img_bchw: np.ndarray, model: keras.Model, last_conv_name: str, target_class: int = 1):
-    """함수 내부에서는 퍼짐 후처리(퍼센타일/블러)를 하지 않는다."""
     x = tf.convert_to_tensor(img_bchw, dtype=tf.float32)
-    feat, head = build_feature_and_head(model, last_conv_name)
-
     with tf.GradientTape() as tape:
-        conv_feat = feat(x, training=False)   # 위치 인자만 사용
-        tape.watch(conv_feat)
-        preds = head(conv_feat, training=False)
-        cls = preds[:, 0] if preds.shape[-1] == 1 else preds[:, target_class]
+        conv_feat, preds = cam_model(x, training=False)
+        if preds.shape[-1] == 1:
+            cls_score = preds[:, 0]
+        else:
+            cls_score = preds[:, target_class]
 
-    grads = tape.gradient(cls, conv_feat)
-    weights = tf.reduce_mean(grads, axis=(0, 1, 2))
+    grads = tape.gradient(cls_score, conv_feat)
+    weights = tf.reduce_mean(grads, axis=(0, 1, 2))  # 채널별 α_k
     cam = tf.reduce_sum(tf.nn.relu(conv_feat[0] * weights), axis=-1)
     cam = (cam - tf.reduce_min(cam)) / (tf.reduce_max(cam) - tf.reduce_min(cam) + 1e-8)
-
-    cam_np = cam.numpy().astype(np.float32)
-    return cam_np, float(preds.numpy().squeeze())
+    return cam.numpy().astype(np.float32), float(preds.numpy().squeeze())
 
 def predict_prob(model, bchw_raw):
     input_name = model.inputs[0].name.split(":")[0]
@@ -205,8 +183,8 @@ except Exception as e:
 base = model.get_layer("densenet121")
 all_names = [l.name for l in base.layers]
 # candidate: relu + concat 계열 위주
-cands = [n for n in all_names if ("relu" in n or "concat" in n or "conv5_block" in n or "conv4_block" in n or "conv3_block" in n)]
-cands = sorted(set(cands), key=lambda s: (("conv4" not in s, "conv5" not in s, "relu" not in s), s))
+cands = [n for n in all_names if ("relu" in n or ("_concat" in n and "block" in n))]
+cands = sorted(set(cands), key=lambda s: (("relu" not in s), s))
 default_name = "relu" if "relu" in all_names else (cands[-1] if cands else all_names[-1])
 chosen_name = st.sidebar.selectbox("Select CAM target layer", cands or all_names, index=(cands or all_names).index(default_name))
 
@@ -228,8 +206,8 @@ if up:
 
                 # 1) CAM 계산 (멀티스케일 or 단일)
                 if use_multiscale and deep_name is not None and prev_name is not None:
-                    cam_deep, p_pneu = gradcam_separated(x_raw_bchw, model, deep_name, target_class=1)
-                    cam_prev, _      = gradcam_separated(x_raw_bchw, model, prev_name, target_class=1)
+                    cam_deep, p_pneu = gradcam_from_any_layer(x_raw_bchw, model, deep_name, target_class=1)
+                    cam_prev, _      = gradcam_from_any_layer(x_raw_bchw, model, prev_name, target_class=1)
 
                     # 정규화
                     cam_deep = cam_deep / (cam_deep.max() + 1e-6)
@@ -239,8 +217,7 @@ if up:
                     heatmap = cam_deep * (cam_prev ** fusion_gamma)
                     layer_label = f"{deep_name} × {prev_name}^{fusion_gamma:.2f}"
                 else:
-                    # 기존 선택 레이어로 단일 CAM
-                    heatmap, p_pneu = gradcam_separated(x_raw_bchw, model, chosen_name, target_class=1)
+                    heatmap, p_pneu = gradcam_from_any_layer(x_raw_bchw, model, chosen_name, target_class=1)
                     layer_label = f"{chosen_name}"
 
                 # 2) 퍼짐 억제: Percentile clip
