@@ -207,47 +207,57 @@ if up:
     with col1:
         st.image(rgb_uint8, caption="Input (224×224)", use_column_width=True)
 
-    if st.button("Run Grad-CAM"):
+        if st.button("Run Grad-CAM"):
         with st.spinner("Running…"):
             try:
-                # 1) conv5 CAM (Top-K 채널만)
-                cam5, p_pneu = gradcam_separated(x_raw_bchw, model, "conv5_block16_concat" if "conv5_block16_concat" in all_names else chosen_name,
-                                                 target_class=1, topk_channels=topk_channels, grad_relu=True)
-                
-                # 2) (옵션) conv4 CAM 구해 멀티스케일 융합
+                # ===================== Grad-CAM 실행 =====================
+                cam5, p_pneu = gradcam_separated(
+                    x_raw_bchw, model,
+                    "conv5_block16_concat" if "conv5_block16_concat" in all_names else chosen_name,
+                    target_class=1, topk_channels=topk_channels, grad_relu=True
+                )
+
+                # 멀티스케일
                 if use_multiscale and any("conv4_block" in n and n.endswith("_concat") for n in all_names):
-                    # conv4에서 가장 마지막 concat 찾기
                     conv4_cands = [n for n in all_names if n.startswith("conv4_block") and n.endswith("_concat")]
-                    conv4_cands.sort(key=lambda s: int(s.split("_block")[1].split("_")[0]))  # block 번호로 정렬
+                    conv4_cands.sort(key=lambda s: int(s.split("_block")[1].split("_")[0]))
                     conv4_last = conv4_cands[-1]
-                    cam4, _ = gradcam_separated(x_raw_bchw, model, conv4_last, target_class=1, topk_channels=None, grad_relu=True)
-                
-                    # 정규화 & 융합: 의미×위치
+                    cam4, _ = gradcam_separated(
+                        x_raw_bchw, model, conv4_last, target_class=1,
+                        topk_channels=None, grad_relu=True
+                    )
                     cam5 = cam5 / (cam5.max() + 1e-6)
                     cam4 = cam4 / (cam4.max() + 1e-6)
                     heatmap = cam5 * (cam4 ** fusion_gamma)
                 else:
                     heatmap = cam5
-                
-                # 3) 퍼짐 억제: 상위 퍼센타일로 클립 (기본 97)
+
+                # 퍼짐 억제
                 heatmap = np.clip(heatmap / (np.percentile(heatmap, percentile_cut) + 1e-6), 0, 1)
-                
-                # 4) (강력) Top-Area %만 남기기
+
+                # Top area
                 th = np.percentile(heatmap, 100 - top_area_pct)
                 binary = (heatmap >= max(th, 1e-6)).astype(np.uint8)
-                
-                # (선택) 작은 잡음 제거를 원하면 오프닝 한 번:
-                # kernel = np.ones((3,3), np.uint8)
-                # binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-                
                 heatmap *= binary.astype(np.float32)
-                
-                # 5) (옵션) 폐 마스크
+
+                # 폐 마스크
                 if use_mask:
                     mh, mw = heatmap.shape
                     m = ellipse_lung_mask(mh, mw, cy, rx, ry, gap)
                     heatmap *= m
-                
-                # 6) 라벨 & 출력
+
+                # 라벨 및 출력
                 label = "PNEUMONIA" if p_pneu >= thresh else "NORMAL"
                 cam_img = overlay_heatmap(rgb_uint8, heatmap)
+
+                with col2:
+                    st.image(cam_img, caption=f"Grad-CAM ({chosen_name})", use_column_width=True)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Predicted", label)
+                c2.metric("Prob. PNEUMONIA", f"{p_pneu*100:.2f}%")
+                c3.metric("Threshold", f"{thresh:.2f}")
+
+            # ✅ 필수: try 블록을 닫아주는 except
+            except Exception as e:
+                st.error(f"Grad-CAM 실패: {type(e).__name__} — {e}")
+
