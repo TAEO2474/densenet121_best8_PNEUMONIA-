@@ -1,5 +1,6 @@
 # ============================================================
 # app.py — DenseNet121_BinaryClassifier 전용, 확실하게 동작하는 분리형 Grad-CAM
+# (퍼짐 최소화: Top-K 채널, conv5×conv4^γ, Percentile clip, Top-area, Lung mask)
 # ============================================================
 
 import os
@@ -127,23 +128,22 @@ def gradcam_separated(img_bchw: np.ndarray, model: keras.Model, last_conv_name: 
     feat, head = build_feature_and_head(model, last_conv_name)
 
     with tf.GradientTape() as tape:
-        conv_feat = feat(x, training=False)
+        conv_feat = feat(x, training=False)     # (1,H,W,C)
         tape.watch(conv_feat)
-        preds = head(conv_feat, training=False)
+        preds = head(conv_feat, training=False) # (1,num_classes or 1)
         cls = preds[:, 0] if preds.shape[-1] == 1 else preds[:, target_class]
 
-    grads = tape.gradient(cls, conv_feat)  # shape: (1,H,W,C)
+    grads = tape.gradient(cls, conv_feat)       # (1,H,W,C)
     if grad_relu:
-        grads = tf.nn.relu(grads)           # 음수 그래디언트 제거 → 퍼짐 감소
+        grads = tf.nn.relu(grads)               # 음수 그래디언트 제거 → 퍼짐 감소
 
-    # 채널 가중치 (H,W 평균)
-    weights = tf.reduce_mean(grads, axis=(0, 1, 2))  # (C,)
+    # 채널 가중치 (H,W 평균) → (C,)
+    weights = tf.reduce_mean(grads, axis=(0, 1, 2))
 
-    # 🔥 Top-K 채널만 사용
+    # Top-K 채널만 사용 (퍼짐 억제)
     if topk_channels is not None:
         k = int(topk_channels)
         k = max(1, min(k, int(weights.shape[0])))
-        # 상위 K 인덱스
         topk = tf.math.top_k(tf.abs(weights), k=k, sorted=False).indices
         mask = tf.scatter_nd(indices=tf.expand_dims(topk, 1),
                              updates=tf.ones((k,), dtype=weights.dtype),
@@ -152,9 +152,7 @@ def gradcam_separated(img_bchw: np.ndarray, model: keras.Model, last_conv_name: 
 
     cam = tf.reduce_sum(tf.nn.relu(conv_feat[0] * weights), axis=-1)  # (H,W)
     cam = (cam - tf.reduce_min(cam)) / (tf.reduce_max(cam) - tf.reduce_min(cam) + 1e-8)
-
     cam_np = cam.numpy().astype(np.float32)
-    # (기존 p90 정규화는 제거: 아래 단계에서 더 공격적으로 자를 것)
     return cam_np, float(preds.numpy().squeeze())
 
 # ----------------------- Sidebar -----------------------
@@ -165,7 +163,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Grad-CAM layer (DenseNet 내부)")
-    st.caption("권장: 마지막 활성화 **relu**. 필요하면 conv4/conv5 concat도 비교 가능.")
+    st.caption("권장: 마지막 활성화 **conv5_block16_concat** (없으면 relu). 필요 시 conv4/conv5 비교.")
 
     st.divider()
     st.subheader("CAM refine")
@@ -175,6 +173,13 @@ with st.sidebar:
     percentile_cut = st.slider("Percentile clip", 90, 99, 97, 1)
     top_area_pct   = st.slider("Keep top area (%)", 5, 30, 15, 1)
 
+    st.divider()
+    st.subheader("Lung mask (optional)")
+    use_mask = st.checkbox("Apply ellipse lung mask", value=True)
+    cy = st.slider("center y", 0.35, 0.60, 0.48, 0.01)
+    rx = st.slider("radius x", 0.15, 0.35, 0.23, 0.01)
+    ry = st.slider("radius y", 0.20, 0.45, 0.32, 0.01)
+    gap = st.slider("gap", 0.05, 0.20, 0.10, 0.01)
 
 # ----------------------- Main -----------------------
 st.title("🩻 Chest X-ray Pneumonia — DenseNet121 + Grad-CAM (Separated)")
@@ -194,8 +199,16 @@ all_names = [l.name for l in base.layers]
 # candidate: relu + concat 계열 위주
 cands = [n for n in all_names if ("relu" in n or "concat" in n or "conv5_block" in n or "conv4_block" in n)]
 cands = sorted(set(cands), key=lambda s: (("conv4" not in s, "conv5" not in s, "relu" not in s), s))
-default_name = "relu" if "relu" in all_names else (cands[-1] if cands else all_names[-1])
-chosen_name = st.sidebar.selectbox("Select CAM target layer", cands or all_names, index=(cands or all_names).index(default_name))
+# conv5 concat을 기본으로 우선
+if "conv5_block16_concat" in all_names:
+    default_name = "conv5_block16_concat"
+elif "relu" in all_names:
+    default_name = "relu"
+else:
+    default_name = (cands[-1] if cands else all_names[-1])
+
+chosen_name = st.sidebar.selectbox("Select CAM target layer", cands or all_names,
+                                   index=(cands or all_names).index(default_name))
 
 # 업로드 & 실행
 up = st.file_uploader("Upload an X-ray (JPG/PNG)", type=["jpg", "jpeg", "png"])
@@ -207,25 +220,67 @@ if up:
     with col1:
         st.image(rgb_uint8, caption="Input (224×224)", use_column_width=True)
 
-    # ✅ 반드시 이렇게 한 단계 들여쓰기 되어야 함
+    # 버튼 실행부 (들여쓰기 주의)
     if st.button("Run Grad-CAM"):
         with st.spinner("Running…"):
             try:
-                # =======================================================
-                # 여기에 네 Grad-CAM 실행 코드 들어가야 함
-                # =======================================================
-
+                # 1) conv5 CAM (Top-K 채널만)
+                target5 = "conv5_block16_concat" if "conv5_block16_concat" in all_names else chosen_name
                 cam5, p_pneu = gradcam_separated(
-                    x_raw_bchw, model,
-                    "conv5_block16_concat" if "conv5_block16_concat" in all_names else chosen_name,
+                    x_raw_bchw, model, target5,
                     target_class=1, topk_channels=topk_channels, grad_relu=True
                 )
 
-                # (나머지 CAM 융합 및 후처리 코드는 그대로)
-                # ...
+                # 2) (옵션) conv4 CAM 구해 멀티스케일 융합
+                if use_multiscale and any("conv4_block" in n and n.endswith("_concat") for n in all_names):
+                    conv4_cands = [n for n in all_names if n.startswith("conv4_block") and n.endswith("_concat")]
+                    # block 번호 기준 정렬 (conv4_block1_concat ... conv4_block32_concat)
+                    conv4_cands.sort(key=lambda s: int(s.split("_block")[1].split("_")[0]))
+                    conv4_last = conv4_cands[-1]
+                    cam4, _ = gradcam_separated(
+                        x_raw_bchw, model, conv4_last,
+                        target_class=1, topk_channels=None, grad_relu=True
+                    )
+                    # 정규화 & 융합: 의미×위치
+                    cam5 = cam5 / (cam5.max() + 1e-6)
+                    cam4 = cam4 / (cam4.max() + 1e-6)
+                    heatmap = cam5 * (cam4 ** fusion_gamma)
+                    layer_label = f"{target5} × {conv4_last}^{fusion_gamma:.2f}"
+                else:
+                    heatmap = cam5
+                    layer_label = f"{target5}"
+
+                # 3) 퍼짐 억제: 상위 퍼센타일로 클립 (기본 97)
+                heatmap = np.clip(heatmap / (np.percentile(heatmap, percentile_cut) + 1e-6), 0, 1)
+
+                # 4) (강력) Top-Area %만 남기기
+                th = np.percentile(heatmap, 100 - top_area_pct)
+                binary = (heatmap >= max(th, 1e-6)).astype(np.uint8)
+                # (원하면 작은 잡음 제거)
+                # kernel = np.ones((3,3), np.uint8)
+                # binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+                heatmap *= binary.astype(np.float32)
+
+                # 5) (옵션) 폐 마스크
+                if use_mask:
+                    mh, mw = heatmap.shape
+                    m = ellipse_lung_mask(mh, mw, cy, rx, ry, gap)
+                    heatmap *= m
+
+                # 6) 라벨 & 출력
+                label = "PNEUMONIA" if p_pneu >= thresh else "NORMAL"
+                cam_img = overlay_heatmap(rgb_uint8, heatmap)
+
+                with col2:
+                    st.image(cam_img, caption=f"Grad-CAM ({layer_label})", use_column_width=True)
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Predicted", label)
+                c2.metric("Prob. PNEUMONIA", f"{p_pneu*100:.2f}%")
+                c3.metric("Threshold", f"{thresh:.2f}")
 
             except Exception as e:
                 st.error(f"Grad-CAM 실패: {type(e).__name__} — {e}")
-
 else:
     st.info("⬆️ X-ray 이미지를 업로드하세요.")
