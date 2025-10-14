@@ -244,6 +244,9 @@ if up:
                     # 정규화 & 융합: 의미×위치
                     cam5 = cam5 / (cam5.max() + 1e-6)
                     cam4 = cam4 / (cam4.max() + 1e-6)
+                    # ⬇️ 여기 추가(리사이즈로 해상도 맞추기)
+                    h, w = cam5.shape
+                    cam4 = cv2.resize(cam4, (w, h), interpolation=cv2.INTER_LINEAR)                    
                     heatmap = cam5 * (cam4 ** fusion_gamma)
                     layer_label = f"{target5} × {conv4_last}^{fusion_gamma:.2f}"
                 else:
