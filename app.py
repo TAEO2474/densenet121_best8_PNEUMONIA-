@@ -1,5 +1,5 @@
 # ============================================================
-# app.py — DenseNet121_BinaryClassifier 전용, 확실하게 동작하는 분리형 Grad-CAM (Any Layer)
+# app.py — DenseNet121_BinaryClassifier 전용, 안정 동작 분리형 Grad-CAM (Any Layer, Dict-Input)
 # ============================================================
 
 import os
@@ -99,25 +99,44 @@ def gradcam_from_any_layer(img_bchw: np.ndarray, model: keras.Model, target_laye
       - target_layer_name의 feature map
       - 최종 출력(model.output)
     을 한 번의 순전파로 받아 Grad-CAM을 계산한다.
-    => 중간 레이어 채널 수가 헤드 기대치와 달라도 안전.
+    입력은 항상 dict({input_name: tensor})로 전달해 KeyError 방지.
     """
+    # 입력 이름 확보 (이 모델은 dict 입력을 요구할 수 있음)
+    input_name = model.inputs[0].name.split(":")[0]
+
+    # DenseNet 서브모델에서 타깃 텐서 찾기
     base = model.get_layer("densenet121")
-    target_tensor = base.get_layer(target_layer_name).output  # 예: 'relu' or 'conv3_block9_concat' 등
+    try:
+        target_tensor = base.get_layer(target_layer_name).output
+    except Exception as e:
+        # 타깃이 없으면 마지막 활성화(relu)로 폴백
+        fallback_name = "relu" if "relu" in [l.name for l in base.layers] else base.layers[-1].name
+        target_tensor = base.get_layer(fallback_name).output
+        target_layer_name = fallback_name
+
     cam_model = keras.Model(inputs=model.input, outputs=[target_tensor, model.output])
 
     x = tf.convert_to_tensor(img_bchw, dtype=tf.float32)
     with tf.GradientTape() as tape:
-        conv_feat, preds = cam_model(x, training=False)
+        conv_feat, preds = cam_model({input_name: x}, training=False)
         if preds.shape[-1] == 1:
             cls_score = preds[:, 0]
         else:
             cls_score = preds[:, target_class]
 
     grads = tape.gradient(cls_score, conv_feat)
+    # 드물게 grads가 None이면 미세한 수치 이슈 → 작은 노이즈 더해 재시도
+    if grads is None:
+        conv_feat += tf.random.normal(tf.shape(conv_feat), stddev=1e-8)
+        with tf.GradientTape() as tape2:
+            preds2 = cam_model({input_name: x}, training=False)[1]
+            cls_score2 = preds2[:, 0] if preds2.shape[-1] == 1 else preds2[:, target_class]
+        grads = tape2.gradient(cls_score2, conv_feat)
+
     weights = tf.reduce_mean(grads, axis=(0, 1, 2))  # 채널별 α_k
     cam = tf.reduce_sum(tf.nn.relu(conv_feat[0] * weights), axis=-1)
     cam = (cam - tf.reduce_min(cam)) / (tf.reduce_max(cam) - tf.reduce_min(cam) + 1e-8)
-    return cam.numpy().astype(np.float32), float(preds.numpy().squeeze())
+    return cam.numpy().astype(np.float32), float(preds.numpy().squeeze()), target_layer_name
 
 def predict_prob(model, bchw_raw):
     input_name = model.inputs[0].name.split(":")[0]
@@ -206,8 +225,8 @@ if up:
 
                 # 1) CAM 계산 (멀티스케일 or 단일)
                 if use_multiscale and deep_name is not None and prev_name is not None:
-                    cam_deep, p_pneu = gradcam_from_any_layer(x_raw_bchw, model, deep_name, target_class=1)
-                    cam_prev, _      = gradcam_from_any_layer(x_raw_bchw, model, prev_name, target_class=1)
+                    cam_deep, p_pneu, deep_used = gradcam_from_any_layer(x_raw_bchw, model, deep_name, target_class=1)
+                    cam_prev, _p2, prev_used   = gradcam_from_any_layer(x_raw_bchw, model, prev_name, target_class=1)
 
                     # 정규화
                     cam_deep = cam_deep / (cam_deep.max() + 1e-6)
@@ -215,10 +234,12 @@ if up:
 
                     # 융합: 깊은층 × (앞층^γ)
                     heatmap = cam_deep * (cam_prev ** fusion_gamma)
-                    layer_label = f"{deep_name} × {prev_name}^{fusion_gamma:.2f}"
+                    layer_label = f"{deep_used} × {prev_used}^{fusion_gamma:.2f}"
+                    p_show = p_pneu
                 else:
-                    heatmap, p_pneu = gradcam_from_any_layer(x_raw_bchw, model, chosen_name, target_class=1)
-                    layer_label = f"{chosen_name}"
+                    heatmap, p_pneu, used = gradcam_from_any_layer(x_raw_bchw, model, chosen_name, target_class=1)
+                    layer_label = f"{used}"
+                    p_show = p_pneu
 
                 # 2) 퍼짐 억제: Percentile clip
                 heatmap = np.clip(heatmap / (np.percentile(heatmap, cam_percentile) + 1e-6), 0, 1)
@@ -234,7 +255,7 @@ if up:
                     heatmap = heatmap * m
 
                 # 5) 분류 라벨 결정
-                label = "PNEUMONIA" if p_pneu >= thresh else "NORMAL"
+                label = "PNEUMONIA" if p_show >= thresh else "NORMAL"
 
                 # 6) 오버레이 렌더
                 cam_img = overlay_heatmap(rgb_uint8, heatmap)
@@ -244,7 +265,7 @@ if up:
 
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Predicted", label)
-                c2.metric("Prob. PNEUMONIA", f"{p_pneu*100:.2f}%")
+                c2.metric("Prob. PNEUMONIA", f"{p_show*100:.2f}%")
                 c3.metric("Threshold", f"{thresh:.2f}")
 
             except Exception as e:
