@@ -1,10 +1,9 @@
 # ============================================================
-# app.py — DenseNet121_BinaryClassifier 전용, 안정 동작 분리형 Grad-CAM (Any Layer, Dict-Input)
+# app.py — DenseNet121_BinaryClassifier 전용, 확실하게 동작하는 분리형 Grad-CAM
 # ============================================================
 
 import os
 from pathlib import Path
-import re
 import numpy as np
 import streamlit as st
 import tensorflow as tf
@@ -92,51 +91,56 @@ def ellipse_lung_mask(h, w, cy=0.48, rx=0.23, ry=0.32, gap=0.10):
     cv2.ellipse(mask, (cx + gap, cy), (rx, ry), 0, 0, 360, 255, -1)
     return (mask > 0).astype(np.float32)
 
-# ----------------------- Grad-CAM (원본 그래프 사용, Any Layer) -----------------------
-def gradcam_from_any_layer(img_bchw: np.ndarray, model: keras.Model, target_layer_name: str, target_class: int = 1):
-    """
-    모델 전체 그래프를 그대로 사용해:
-      - target_layer_name의 feature map
-      - 최종 출력(model.output)
-    을 한 번의 순전파로 받아 Grad-CAM을 계산한다.
-    입력은 항상 dict({input_name: tensor})로 전달해 KeyError 방지.
-    """
-    # 입력 이름 확보 (이 모델은 dict 입력을 요구할 수 있음)
-    input_name = model.inputs[0].name.split(":")[0]
+# ----------------------- 분리형 Grad-CAM 빌더 -----------------------
+def build_feature_and_head(model: keras.Model, last_conv_name: str):
+    preprocess_layer = model.get_layer("densenet_preprocess")
+    base             = model.get_layer("densenet121")
 
-    # DenseNet 서브모델에서 타깃 텐서 찾기
-    base = model.get_layer("densenet121")
-    try:
-        target_tensor = base.get_layer(target_layer_name).output
-    except Exception as e:
-        # 타깃이 없으면 마지막 활성화(relu)로 폴백
-        fallback_name = "relu" if "relu" in [l.name for l in base.layers] else base.layers[-1].name
-        target_tensor = base.get_layer(fallback_name).output
-        target_layer_name = fallback_name
+    # DenseNet 내부 서브모델: base.input -> last_conv.output
+    last_conv_tensor_inner = base.get_layer(last_conv_name).output
+    feat_inner = keras.Model(base.input, last_conv_tensor_inner, name="feat_inner")
 
-    cam_model = keras.Model(inputs=model.input, outputs=[target_tensor, model.output])
+    # 새 입력으로 완전 새 경로 구성 (기존 심볼릭 텐서 재사용 금지!)
+    cam_input = keras.Input(shape=model.input_shape[1:], name="cam_input")
+    z = preprocess_layer(cam_input)
+    z = feat_inner(z)
+    feature_extractor = keras.Model(cam_input, z, name="feature_extractor")
 
+    # densenet121 이후 헤드 재사용 (GAP/Dropout/Dense)
+    head_input = keras.Input(shape=z.shape[1:], name="cam_head_in")
+    x = head_input
+    passed = False
+    for lyr in model.layers:
+        if lyr.name == "densenet121":
+            passed = True
+            continue
+        if not passed:
+            continue
+        x = lyr(x)
+    classifier_head = keras.Model(head_input, x, name="classifier_head")
+    return feature_extractor, classifier_head
+
+# ----------------------- Grad-CAM (분리형) -----------------------
+def gradcam_separated(img_bchw: np.ndarray, model: keras.Model, last_conv_name: str, target_class: int = 1):
     x = tf.convert_to_tensor(img_bchw, dtype=tf.float32)
+    feat, head = build_feature_and_head(model, last_conv_name)
+
     with tf.GradientTape() as tape:
-        conv_feat, preds = cam_model({input_name: x}, training=False)
-        if preds.shape[-1] == 1:
-            cls_score = preds[:, 0]
-        else:
-            cls_score = preds[:, target_class]
+        conv_feat = feat(x, training=False)   # 위치 인자만 사용
+        tape.watch(conv_feat)
+        preds = head(conv_feat, training=False)
+        cls = preds[:, 0] if preds.shape[-1] == 1 else preds[:, target_class]
 
-    grads = tape.gradient(cls_score, conv_feat)
-    # 드물게 grads가 None이면 미세한 수치 이슈 → 작은 노이즈 더해 재시도
-    if grads is None:
-        conv_feat += tf.random.normal(tf.shape(conv_feat), stddev=1e-8)
-        with tf.GradientTape() as tape2:
-            preds2 = cam_model({input_name: x}, training=False)[1]
-            cls_score2 = preds2[:, 0] if preds2.shape[-1] == 1 else preds2[:, target_class]
-        grads = tape2.gradient(cls_score2, conv_feat)
-
-    weights = tf.reduce_mean(grads, axis=(0, 1, 2))  # 채널별 α_k
+    grads = tape.gradient(cls, conv_feat)
+    weights = tf.reduce_mean(grads, axis=(0, 1, 2))
     cam = tf.reduce_sum(tf.nn.relu(conv_feat[0] * weights), axis=-1)
     cam = (cam - tf.reduce_min(cam)) / (tf.reduce_max(cam) - tf.reduce_min(cam) + 1e-8)
-    return cam.numpy().astype(np.float32), float(preds.numpy().squeeze()), target_layer_name
+
+    cam_np = cam.numpy().astype(np.float32)
+    p90 = float(np.percentile(cam_np, 90.0))
+    cam_np = np.clip(cam_np / (p90 + 1e-6), 0, 1)
+    cam_np = cv2.GaussianBlur(cam_np, (3, 3), 0)
+    return cam_np, float(preds.numpy().squeeze())
 
 def predict_prob(model, bchw_raw):
     input_name = model.inputs[0].name.split(":")[0]
@@ -144,22 +148,6 @@ def predict_prob(model, bchw_raw):
     if isinstance(prob, (list, tuple)):
         prob = prob[0]
     return float(np.asarray(prob).squeeze())
-
-# ----------------------- 유틸: concat 레이어 자동 선택 -----------------------
-def _sorted_concats(base_layer_names):
-    concats = [n for n in base_layer_names if n.endswith("_concat") and "block" in n]
-    def depth_key(n):
-        m = re.search(r"conv(\d+)_block(\d+)_concat", n)
-        return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
-    return sorted(concats, key=depth_key)
-
-def pick_deep_and_prev(base_layer_names):
-    concats = _sorted_concats(base_layer_names)
-    if not concats:
-        return None, None
-    deep = concats[-1]
-    prev = concats[-2] if len(concats) >= 2 else None
-    return deep, prev
 
 # ----------------------- Sidebar -----------------------
 with st.sidebar:
@@ -169,7 +157,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Grad-CAM layer (DenseNet 내부)")
-    st.caption("권장: 마지막 활성화 **relu**. 필요하면 concat 계열도 비교 가능.")
+    st.caption("권장: 마지막 활성화 **relu**. 필요하면 conv4/conv5 concat도 비교 가능.")
 
     st.divider()
     st.subheader("Lung mask (optional)")
@@ -178,13 +166,6 @@ with st.sidebar:
     rx = st.slider("radius x", 0.15, 0.35, 0.23, 0.01)
     ry = st.slider("radius y", 0.20, 0.45, 0.32, 0.01)
     gap = st.slider("gap", 0.05, 0.20, 0.10, 0.01)
-
-    st.divider()
-    st.subheader("CAM refine")
-    use_multiscale = st.checkbox("Use multiscale (deep × prev)", value=True)
-    fusion_gamma = st.slider("Prev exponent (γ)", 0.3, 1.5, 0.7, 0.1)
-    cam_percentile = st.slider("Percentile clip", 80, 99, 97, 1)
-    cam_blur = st.checkbox("Gaussian blur after fuse (3×3)", value=False)
 
 # ----------------------- Main -----------------------
 st.title("🩻 Chest X-ray Pneumonia — DenseNet121 + Grad-CAM (Separated)")
@@ -202,8 +183,8 @@ except Exception as e:
 base = model.get_layer("densenet121")
 all_names = [l.name for l in base.layers]
 # candidate: relu + concat 계열 위주
-cands = [n for n in all_names if ("relu" in n or ("_concat" in n and "block" in n))]
-cands = sorted(set(cands), key=lambda s: (("relu" not in s), s))
+cands = [n for n in all_names if ("relu" in n or "concat" in n or "conv5_block" in n or "conv4_block" in n)]
+cands = sorted(set(cands), key=lambda s: (("conv4" not in s, "conv5" not in s, "relu" not in s), s))
 default_name = "relu" if "relu" in all_names else (cands[-1] if cands else all_names[-1])
 chosen_name = st.sidebar.selectbox("Select CAM target layer", cands or all_names, index=(cands or all_names).index(default_name))
 
@@ -220,52 +201,22 @@ if up:
     if st.button("Run Grad-CAM"):
         with st.spinner("Running…"):
             try:
-                # 0) 가장 깊은 concat과 그 직전 concat 자동 선택
-                deep_name, prev_name = pick_deep_and_prev(all_names)
+                heatmap, p_pneu = gradcam_separated(x_raw_bchw, model, chosen_name, target_class=1)
+                label = "PNEUMONIA" if p_pneu >= thresh else "NORMAL"
 
-                # 1) CAM 계산 (멀티스케일 or 단일)
-                if use_multiscale and deep_name is not None and prev_name is not None:
-                    cam_deep, p_pneu, deep_used = gradcam_from_any_layer(x_raw_bchw, model, deep_name, target_class=1)
-                    cam_prev, _p2, prev_used   = gradcam_from_any_layer(x_raw_bchw, model, prev_name, target_class=1)
-
-                    # 정규화
-                    cam_deep = cam_deep / (cam_deep.max() + 1e-6)
-                    cam_prev = cam_prev / (cam_prev.max() + 1e-6)
-
-                    # 융합: 깊은층 × (앞층^γ)
-                    heatmap = cam_deep * (cam_prev ** fusion_gamma)
-                    layer_label = f"{deep_used} × {prev_used}^{fusion_gamma:.2f}"
-                    p_show = p_pneu
-                else:
-                    heatmap, p_pneu, used = gradcam_from_any_layer(x_raw_bchw, model, chosen_name, target_class=1)
-                    layer_label = f"{used}"
-                    p_show = p_pneu
-
-                # 2) 퍼짐 억제: Percentile clip
-                heatmap = np.clip(heatmap / (np.percentile(heatmap, cam_percentile) + 1e-6), 0, 1)
-
-                # 3) (옵션) 블러
-                if cam_blur:
-                    heatmap = cv2.GaussianBlur(heatmap.astype(np.float32), (3, 3), 0)
-
-                # 4) (옵션) 폐 마스크 적용
                 if use_mask:
                     mh, mw = heatmap.shape
                     m = ellipse_lung_mask(mh, mw, cy, rx, ry, gap)
                     heatmap = heatmap * m
 
-                # 5) 분류 라벨 결정
-                label = "PNEUMONIA" if p_show >= thresh else "NORMAL"
-
-                # 6) 오버레이 렌더
                 cam_img = overlay_heatmap(rgb_uint8, heatmap)
 
                 with col2:
-                    st.image(cam_img, caption=f"Grad-CAM ({layer_label})", use_column_width=True)
+                    st.image(cam_img, caption=f"Grad-CAM ({chosen_name})", use_column_width=True)
 
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Predicted", label)
-                c2.metric("Prob. PNEUMONIA", f"{p_show*100:.2f}%")
+                c2.metric("Prob. PNEUMONIA", f"{p_pneu*100:.2f}%")
                 c3.metric("Threshold", f"{thresh:.2f}")
 
             except Exception as e:
