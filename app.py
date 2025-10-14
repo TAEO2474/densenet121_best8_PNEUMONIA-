@@ -4,6 +4,7 @@
 
 import os
 from pathlib import Path
+import re
 import numpy as np
 import streamlit as st
 import tensorflow as tf
@@ -119,11 +120,10 @@ def build_feature_and_head(model: keras.Model, last_conv_name: str):
         x = lyr(x)
     classifier_head = keras.Model(head_input, x, name="classifier_head")
     return feature_extractor, classifier_head
- 
-
 
 # ----------------------- Grad-CAM (분리형) -----------------------
 def gradcam_separated(img_bchw: np.ndarray, model: keras.Model, last_conv_name: str, target_class: int = 1):
+    """함수 내부에서는 퍼짐 후처리(퍼센타일/블러)를 하지 않는다."""
     x = tf.convert_to_tensor(img_bchw, dtype=tf.float32)
     feat, head = build_feature_and_head(model, last_conv_name)
 
@@ -139,11 +139,7 @@ def gradcam_separated(img_bchw: np.ndarray, model: keras.Model, last_conv_name: 
     cam = (cam - tf.reduce_min(cam)) / (tf.reduce_max(cam) - tf.reduce_min(cam) + 1e-8)
 
     cam_np = cam.numpy().astype(np.float32)
-    p90 = float(np.percentile(cam_np, 90.0))
-    cam_np = np.clip(cam_np / (p90 + 1e-6), 0, 1)
-    cam_np = cv2.GaussianBlur(cam_np, (3, 3), 0)
     return cam_np, float(preds.numpy().squeeze())
-
 
 def predict_prob(model, bchw_raw):
     input_name = model.inputs[0].name.split(":")[0]
@@ -152,6 +148,21 @@ def predict_prob(model, bchw_raw):
         prob = prob[0]
     return float(np.asarray(prob).squeeze())
 
+# ----------------------- 유틸: concat 레이어 자동 선택 -----------------------
+def _sorted_concats(base_layer_names):
+    concats = [n for n in base_layer_names if n.endswith("_concat") and "block" in n]
+    def depth_key(n):
+        m = re.search(r"conv(\d+)_block(\d+)_concat", n)
+        return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+    return sorted(concats, key=depth_key)
+
+def pick_deep_and_prev(base_layer_names):
+    concats = _sorted_concats(base_layer_names)
+    if not concats:
+        return None, None
+    deep = concats[-1]
+    prev = concats[-2] if len(concats) >= 2 else None
+    return deep, prev
 
 # ----------------------- Sidebar -----------------------
 with st.sidebar:
@@ -161,7 +172,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Grad-CAM layer (DenseNet 내부)")
-    st.caption("권장: 마지막 활성화 **relu**. 필요하면 conv4/conv5 concat도 비교 가능.")
+    st.caption("권장: 마지막 활성화 **relu**. 필요하면 concat 계열도 비교 가능.")
 
     st.divider()
     st.subheader("Lung mask (optional)")
@@ -194,7 +205,7 @@ except Exception as e:
 base = model.get_layer("densenet121")
 all_names = [l.name for l in base.layers]
 # candidate: relu + concat 계열 위주
-cands = [n for n in all_names if ("relu" in n or "concat" in n or "conv5_block" in n or "conv4_block" in n)]
+cands = [n for n in all_names if ("relu" in n or "concat" in n or "conv5_block" in n or "conv4_block" in n or "conv3_block" in n)]
 cands = sorted(set(cands), key=lambda s: (("conv4" not in s, "conv5" not in s, "relu" not in s), s))
 default_name = "relu" if "relu" in all_names else (cands[-1] if cands else all_names[-1])
 chosen_name = st.sidebar.selectbox("Select CAM target layer", cands or all_names, index=(cands or all_names).index(default_name))
@@ -210,58 +221,56 @@ if up:
         st.image(rgb_uint8, caption="Input (224×224)", use_column_width=True)
 
     if st.button("Run Grad-CAM"):
-    with st.spinner("Running…"):
-        try:
-            # 0) 가장 깊은 concat과 그 직전 concat 자동 선택
-            deep_name, prev_name = pick_deep_and_prev(all_names)
+        with st.spinner("Running…"):
+            try:
+                # 0) 가장 깊은 concat과 그 직전 concat 자동 선택
+                deep_name, prev_name = pick_deep_and_prev(all_names)
 
-            # 1) CAM 계산 (멀티스케일 or 단일)
-            if use_multiscale and deep_name is not None and prev_name is not None:
-                cam_deep, p_pneu = gradcam_separated(x_raw_bchw, model, deep_name, target_class=1)
-                cam_prev, _      = gradcam_separated(x_raw_bchw, model, prev_name, target_class=1)
+                # 1) CAM 계산 (멀티스케일 or 단일)
+                if use_multiscale and deep_name is not None and prev_name is not None:
+                    cam_deep, p_pneu = gradcam_separated(x_raw_bchw, model, deep_name, target_class=1)
+                    cam_prev, _      = gradcam_separated(x_raw_bchw, model, prev_name, target_class=1)
 
-                # 정규화
-                cam_deep = cam_deep / (cam_deep.max() + 1e-6)
-                cam_prev = cam_prev / (cam_prev.max() + 1e-6)
+                    # 정규화
+                    cam_deep = cam_deep / (cam_deep.max() + 1e-6)
+                    cam_prev = cam_prev / (cam_prev.max() + 1e-6)
 
-                # 융합: 깊은층 × (앞층^γ)
-                heatmap = cam_deep * (cam_prev ** fusion_gamma)
-                layer_label = f"{deep_name} × {prev_name}^{fusion_gamma:.2f}"
-            else:
-                # 기존 선택 레이어로 단일 CAM
-                heatmap, p_pneu = gradcam_separated(x_raw_bchw, model, chosen_name, target_class=1)
-                layer_label = f"{chosen_name}"
+                    # 융합: 깊은층 × (앞층^γ)
+                    heatmap = cam_deep * (cam_prev ** fusion_gamma)
+                    layer_label = f"{deep_name} × {prev_name}^{fusion_gamma:.2f}"
+                else:
+                    # 기존 선택 레이어로 단일 CAM
+                    heatmap, p_pneu = gradcam_separated(x_raw_bchw, model, chosen_name, target_class=1)
+                    layer_label = f"{chosen_name}"
 
-            # 2) 퍼짐 억제: Percentile clip (기본 97)
-            heatmap = np.clip(heatmap / (np.percentile(heatmap, cam_percentile) + 1e-6), 0, 1)
+                # 2) 퍼짐 억제: Percentile clip
+                heatmap = np.clip(heatmap / (np.percentile(heatmap, cam_percentile) + 1e-6), 0, 1)
 
-            # 3) (옵션) 블러
-            if cam_blur:
-                heatmap = cv2.GaussianBlur(heatmap.astype(np.float32), (3, 3), 0)
+                # 3) (옵션) 블러
+                if cam_blur:
+                    heatmap = cv2.GaussianBlur(heatmap.astype(np.float32), (3, 3), 0)
 
-            # 4) (옵션) 폐 마스크 적용
-            if use_mask:
-                mh, mw = heatmap.shape
-                m = ellipse_lung_mask(mh, mw, cy, rx, ry, gap)
-                heatmap = heatmap * m
+                # 4) (옵션) 폐 마스크 적용
+                if use_mask:
+                    mh, mw = heatmap.shape
+                    m = ellipse_lung_mask(mh, mw, cy, rx, ry, gap)
+                    heatmap = heatmap * m
 
-            # 5) 분류 라벨 결정
-            label = "PNEUMONIA" if p_pneu >= thresh else "NORMAL"
+                # 5) 분류 라벨 결정
+                label = "PNEUMONIA" if p_pneu >= thresh else "NORMAL"
 
-            # 6) 오버레이 렌더
-            cam_img = overlay_heatmap(rgb_uint8, heatmap)
+                # 6) 오버레이 렌더
+                cam_img = overlay_heatmap(rgb_uint8, heatmap)
 
-            with col2:
-                st.image(cam_img, caption=f"Grad-CAM ({layer_label})", use_column_width=True)
+                with col2:
+                    st.image(cam_img, caption=f"Grad-CAM ({layer_label})", use_column_width=True)
 
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Predicted", label)
-            c2.metric("Prob. PNEUMONIA", f"{p_pneu*100:.2f}%")
-            c3.metric("Threshold", f"{thresh:.2f}")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Predicted", label)
+                c2.metric("Prob. PNEUMONIA", f"{p_pneu*100:.2f}%")
+                c3.metric("Threshold", f"{thresh:.2f}")
 
-        except Exception as e:
-            st.error(f"Grad-CAM 실패: {type(e).__name__} — {e}")
+            except Exception as e:
+                st.error(f"Grad-CAM 실패: {type(e).__name__} — {e}")
 else:
     st.info("⬆️ X-ray 이미지를 업로드하세요.")
-
-
