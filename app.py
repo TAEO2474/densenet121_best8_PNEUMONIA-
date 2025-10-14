@@ -171,6 +171,13 @@ with st.sidebar:
     ry = st.slider("radius y", 0.20, 0.45, 0.32, 0.01)
     gap = st.slider("gap", 0.05, 0.20, 0.10, 0.01)
 
+    st.divider()
+    st.subheader("CAM refine")
+    use_multiscale = st.checkbox("Use multiscale (deep × prev)", value=True)
+    fusion_gamma = st.slider("Prev exponent (γ)", 0.3, 1.5, 0.7, 0.1)
+    cam_percentile = st.slider("Percentile clip", 80, 99, 97, 1)
+    cam_blur = st.checkbox("Gaussian blur after fuse (3×3)", value=False)
+
 # ----------------------- Main -----------------------
 st.title("🩻 Chest X-ray Pneumonia — DenseNet121 + Grad-CAM (Separated)")
 st.caption("의사용 장비가 아닙니다. 참고용 해석 도구입니다.")
@@ -203,27 +210,57 @@ if up:
         st.image(rgb_uint8, caption="Input (224×224)", use_column_width=True)
 
     if st.button("Run Grad-CAM"):
-        with st.spinner("Running…"):
-            try:
+    with st.spinner("Running…"):
+        try:
+            # 0) 가장 깊은 concat과 그 직전 concat 자동 선택
+            deep_name, prev_name = pick_deep_and_prev(all_names)
+
+            # 1) CAM 계산 (멀티스케일 or 단일)
+            if use_multiscale and deep_name is not None and prev_name is not None:
+                cam_deep, p_pneu = gradcam_separated(x_raw_bchw, model, deep_name, target_class=1)
+                cam_prev, _      = gradcam_separated(x_raw_bchw, model, prev_name, target_class=1)
+
+                # 정규화
+                cam_deep = cam_deep / (cam_deep.max() + 1e-6)
+                cam_prev = cam_prev / (cam_prev.max() + 1e-6)
+
+                # 융합: 깊은층 × (앞층^γ)
+                heatmap = cam_deep * (cam_prev ** fusion_gamma)
+                layer_label = f"{deep_name} × {prev_name}^{fusion_gamma:.2f}"
+            else:
+                # 기존 선택 레이어로 단일 CAM
                 heatmap, p_pneu = gradcam_separated(x_raw_bchw, model, chosen_name, target_class=1)
-                label = "PNEUMONIA" if p_pneu >= thresh else "NORMAL"
+                layer_label = f"{chosen_name}"
 
-                if use_mask:
-                    mh, mw = heatmap.shape
-                    m = ellipse_lung_mask(mh, mw, cy, rx, ry, gap)
-                    heatmap = heatmap * m
+            # 2) 퍼짐 억제: Percentile clip (기본 97)
+            heatmap = np.clip(heatmap / (np.percentile(heatmap, cam_percentile) + 1e-6), 0, 1)
 
-                cam_img = overlay_heatmap(rgb_uint8, heatmap)
+            # 3) (옵션) 블러
+            if cam_blur:
+                heatmap = cv2.GaussianBlur(heatmap.astype(np.float32), (3, 3), 0)
 
-                with col2:
-                    st.image(cam_img, caption=f"Grad-CAM ({chosen_name})", use_column_width=True)
+            # 4) (옵션) 폐 마스크 적용
+            if use_mask:
+                mh, mw = heatmap.shape
+                m = ellipse_lung_mask(mh, mw, cy, rx, ry, gap)
+                heatmap = heatmap * m
 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Predicted", label)
-                c2.metric("Prob. PNEUMONIA", f"{p_pneu*100:.2f}%")
-                c3.metric("Threshold", f"{thresh:.2f}")
+            # 5) 분류 라벨 결정(Threshold는 그대로)
+            label = "PNEUMONIA" if p_pneu >= thresh else "NORMAL"
 
-            except Exception as e:
-                st.error(f"Grad-CAM 실패: {type(e).__name__} — {e}")
+            # 6) 오버레이 렌더
+            cam_img = overlay_heatmap(rgb_uint8, heatmap)
+
+            with col2:
+                st.image(cam_img, caption=f"Grad-CAM ({layer_label})", use_column_width=True)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Predicted", label)
+            c2.metric("Prob. PNEUMONIA", f"{p_pneu*100:.2f}%")
+            c3.metric("Threshold", f"{thresh:.2f}")
+
+        except Exception as e:
+            st.error(f"Grad-CAM 실패: {type(e).__name__} — {e}")
 else:
     st.info("⬆️ X-ray 이미지를 업로드하세요.")
+
