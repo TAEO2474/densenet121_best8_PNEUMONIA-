@@ -1,5 +1,5 @@
 # ============================================================
-# app.py — DenseNet121_BinaryClassifier 전용, 분리형 Grad-CAM 확실 작동 버전
+# app.py — DenseNet121_BinaryClassifier 전용, 확실하게 동작하는 분리형 Grad-CAM
 # ============================================================
 
 import os
@@ -19,8 +19,8 @@ CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 IMG_SIZE = (224, 224)
 
 MODEL_DIR = Path("models"); MODEL_DIR.mkdir(parents=True, exist_ok=True)
-MODEL_LOCAL = MODEL_DIR / "densenet121_best.keras"  # 파일명은 네가 실제 배포한 이름으로 맞추면 됨
-FILE_ID = st.secrets.get("MODEL_FILE_ID", "")       # gdown File ID (선택)
+MODEL_LOCAL = MODEL_DIR / "densenet121_best.keras"     # ← 실제 파일명에 맞춰 수정 가능
+FILE_ID = st.secrets.get("MODEL_FILE_ID", "")          # gdown File ID (선택)
 HTTP_FALLBACK_URL = st.secrets.get("MODEL_DIRECT_URL", "")  # 직접 URL (선택)
 TIMEOUT = 120
 
@@ -41,7 +41,6 @@ def _http_download(url: str, out: Path) -> bool:
 def ensure_model_file_cached() -> str:
     if MODEL_LOCAL.exists() and MODEL_LOCAL.stat().st_size > 0:
         return str(MODEL_LOCAL)
-    # 1) gdown
     if FILE_ID:
         try:
             gdown.download(id=FILE_ID, output=str(MODEL_LOCAL), quiet=False, fuzzy=True)
@@ -49,7 +48,6 @@ def ensure_model_file_cached() -> str:
             pass
         if MODEL_LOCAL.exists() and MODEL_LOCAL.stat().st_size > 0:
             return str(MODEL_LOCAL)
-    # 2) HTTP fallback
     if HTTP_FALLBACK_URL:
         _http_download(HTTP_FALLBACK_URL, MODEL_LOCAL)
         if MODEL_LOCAL.exists() and MODEL_LOCAL.stat().st_size > 0:
@@ -58,7 +56,7 @@ def ensure_model_file_cached() -> str:
 
 @st.cache_resource(show_spinner=False)
 def load_model(model_path: str):
-    # Lambda(preprocess_input) 복원 위해 custom_objects 등록
+    # Lambda(preprocess_input) 복원을 위해 custom_objects 등록
     return keras.models.load_model(
         model_path,
         custom_objects={"preprocess_input": preprocess_input},
@@ -93,76 +91,81 @@ def ellipse_lung_mask(h, w, cy=0.48, rx=0.23, ry=0.32, gap=0.10):
     cv2.ellipse(mask, (cx + gap, cy), (rx, ry), 0, 0, 360, 255, -1)
     return (mask > 0).astype(np.float32)
 
-# ----------------------- 분리형 Grad-CAM -----------------------
-def build_feature_and_classifier(model: keras.Model, last_conv_name: str):
+# ----------------------- 분리형 Grad-CAM 빌더 -----------------------
+def build_feature_and_head(model: keras.Model, last_conv_name: str):
     """
-    네가 학습한 전체 모델을 아래처럼 분해:
-    - preproc: input_image -> densenet_preprocess 출력
-    - backbone: DenseNet121 (base_model) 의 'last_conv_name'까지
-    - classifier: (GAP -> Dropout -> Dense) 머리부분
+    preprocess 서브모델은 만들지 않음!
+    'input_image'를 입력으로 받아
+    input_image → densenet_preprocess → densenet121 → <last_conv_name>
+    까지 바로 잇는 feature_extractor만 생성.
+    이후의 GAP/Dropout/Dense는 classifier_head로 재구성.
     """
-    # 1) 서브그래프: 전처리
-    pre_in = model.get_layer("input_image").input
-    pre_out = model.get_layer("densenet_preprocess").output
-    preproc = keras.Model(pre_in, pre_out, name="preprocessor")
-
-    # 2) 서브그래프: DenseNet121의 마지막 conv/활성화 출력
+    input_tensor = model.get_layer("input_image").input   # 전체 입력
     base = model.get_layer("densenet121")
-    last_conv = base.get_layer(last_conv_name)  # 기본 'relu' 추천
-    feature_extractor = keras.Model(base.input, last_conv.output, name="feature_extractor")
 
-    # 3) 서브그래프: classifier 머리 (backbone 이후 레이어만 재구성)
-    #    원래 모델 순서: [input_image, densenet_preprocess, densenet121, GAP, Dropout, Dense]
-    #    → densenet121 이후 레이어들만 그대로 재사용
-    classifier_in = keras.Input(shape=last_conv.output.shape[1:], name="cam_head_in")
-    x = classifier_in
+    # DenseNet 내부의 타깃 텐서(예: 'relu' 또는 'conv4_block24_concat')
+    last_conv_tensor = base.get_layer(last_conv_name).output
+
+    # feature_extractor: input_image → ... → last_conv_tensor
+    feature_extractor = keras.Model(inputs=input_tensor, outputs=last_conv_tensor, name="feature_extractor")
+
+    # classifier_head: densenet121 이후 레이어를 그대로 통과
+    head_in = keras.Input(shape=last_conv_tensor.shape[1:], name="cam_head_in")
+    x = head_in
+    passed = False
     for lyr in model.layers:
-        if lyr.name in ["input_image", "densenet_preprocess", "densenet121"]:
+        if lyr.name == "densenet121":
+            passed = True
+            continue
+        if not passed:
             continue
         x = lyr(x)
-    classifier = keras.Model(classifier_in, x, name="classifier_head")
+    classifier_head = keras.Model(head_in, x, name="classifier_head")
+    return feature_extractor, classifier_head
 
-    return preproc, feature_extractor, classifier
-
+# ----------------------- Grad-CAM (분리형) -----------------------
 def gradcam_separated(img_bchw: np.ndarray, model: keras.Model, last_conv_name: str, target_class: int = 1):
     """
-    분리형(권장) Grad-CAM:
-    - x -> preproc(x) -> feature_extractor(relu까지) -> conv_feat
-    - preds = classifier(conv_feat)
-    - d(preds[:,target])/d(conv_feat) 로 CAM 생성
+    항상 '이름-딕셔너리'로만 호출해서 그래프 매핑 고정.
     """
     x = tf.convert_to_tensor(img_bchw, dtype=tf.float32)
+    input_name = model.inputs[0].name.split(":")[0]  # 보통 'input_image'
 
-    # 분리 그래프 구성
-    preproc, feat, head = build_feature_and_classifier(model, last_conv_name)
+    feat, head = build_feature_and_head(model, last_conv_name)
 
-    # 전방통과 + Gradient 계산
     with tf.GradientTape() as tape:
-        x_pp = preproc(x, training=False)
-        conv_feat = feat(x_pp, training=False)
+        conv_feat = feat({input_name: x}, training=False)   # ✅ dict only
         tape.watch(conv_feat)
+        preds = head(conv_feat, training=False)
 
-        preds = head(conv_feat, training=False)  # shape: (1,1) 이진
+        # 이진(sigmoid) 기준
         if preds.shape[-1] == 1:
             cls = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
         else:
             cls = preds[:, target_class]
 
-    grads = tape.gradient(cls, conv_feat)                 # [1,Hc,Wc,C]
+    grads = tape.gradient(cls, conv_feat)                  # [1,Hc,Wc,C]
     if grads is None:
         raise RuntimeError("Gradient is None — 레이어 이름을 'relu' 등으로 바꿔보세요.")
 
-    weights = tf.reduce_mean(grads, axis=(0, 1, 2))       # [C]
+    weights = tf.reduce_mean(grads, axis=(0, 1, 2))        # [C]
     cam = tf.reduce_sum(tf.nn.relu(conv_feat[0] * weights), axis=-1)  # [Hc,Wc]
     cam = (cam - tf.reduce_min(cam)) / (tf.reduce_max(cam) - tf.reduce_min(cam) + 1e-8)
     cam_np = cam.numpy().astype(np.float32)
 
-    # 살짝 블러 + 가벼운 대비
+    # 살짝 대비 + 은은한 블러
     p90 = float(np.percentile(cam_np, 90.0))
     cam_np = np.clip(cam_np / (p90 + 1e-6), 0, 1)
     cam_np = cv2.GaussianBlur(cam_np, (3, 3), 0)
 
     return cam_np, float(preds.numpy().squeeze())
+
+def predict_prob(model: keras.Model, bchw_raw: np.ndarray) -> float:
+    input_name = model.inputs[0].name.split(":")[0]
+    prob = model({input_name: bchw_raw}, training=False)   # ✅ dict only
+    if isinstance(prob, (list, tuple)):
+        prob = prob[0]
+    return float(np.asarray(prob).squeeze())
 
 # ----------------------- Sidebar -----------------------
 with st.sidebar:
@@ -171,10 +174,8 @@ with st.sidebar:
     st.caption("• 낮추면 민감도↑ • 높이면 정상 보호(오탐↓)")
 
     st.divider()
-    st.subheader("Grad-CAM layer")
-    st.caption("권장: DenseNet121 내부 마지막 활성화 **relu**")
-    # 필요시 conv4/conv5의 concat이나 relu를 선택해 비교할 수 있게 옵션 제공
-    # 기본은 'relu' 로 두고, 목록은 로딩 후 채움
+    st.subheader("Grad-CAM layer (DenseNet 내부)")
+    st.caption("권장: 마지막 활성화 **relu**. 필요하면 conv4/conv5 concat도 비교 가능.")
 
     st.divider()
     st.subheader("Lung mask (optional)")
@@ -186,7 +187,7 @@ with st.sidebar:
 
 # ----------------------- Main -----------------------
 st.title("🩻 Chest X-ray Pneumonia — DenseNet121 + Grad-CAM (Separated)")
-st.caption("Colab과 동일한 감으로 동작. 의사용 장비가 아닙니다.")
+st.caption("의사용 장비가 아닙니다. 참고용 해석 도구입니다.")
 
 # 모델 로드
 try:
@@ -196,15 +197,16 @@ except Exception as e:
     st.error(f"모델 로딩 실패: {e}")
     st.stop()
 
-# DenseNet 내부 레이어 목록(선택 박스용)
+# DenseNet 내부 레이어 목록 & 기본값
 base = model.get_layer("densenet121")
 all_names = [l.name for l in base.layers]
-# 마지막에 쓰기 좋은 후보들(먼저 'relu'가 있으면 그걸 기본값)
-candidate_names = [n for n in all_names if ("relu" in n or "concat" in n or "conv5_block" in n)]
-default_name = "relu" if "relu" in all_names else (candidate_names[-1] if candidate_names else all_names[-1])
-chosen_name = st.sidebar.selectbox("Select CAM target layer", candidate_names or all_names, index=(candidate_names or all_names).index(default_name))
+# candidate: relu + concat 계열 위주
+cands = [n for n in all_names if ("relu" in n or "concat" in n or "conv5_block" in n or "conv4_block" in n)]
+cands = sorted(set(cands), key=lambda s: (("conv4" not in s, "conv5" not in s, "relu" not in s), s))
+default_name = "relu" if "relu" in all_names else (cands[-1] if cands else all_names[-1])
+chosen_name = st.sidebar.selectbox("Select CAM target layer", cands or all_names, index=(cands or all_names).index(default_name))
 
-# 업로드
+# 업로드 & 실행
 up = st.file_uploader("Upload an X-ray (JPG/PNG)", type=["jpg", "jpeg", "png"])
 if up:
     pil_img = Image.open(up)
@@ -217,7 +219,6 @@ if up:
     if st.button("Run Grad-CAM"):
         with st.spinner("Running…"):
             try:
-                # Grad-CAM (분리형)
                 heatmap, p_pneu = gradcam_separated(x_raw_bchw, model, chosen_name, target_class=1)
                 label = "PNEUMONIA" if p_pneu >= thresh else "NORMAL"
 
@@ -231,10 +232,10 @@ if up:
                 with col2:
                     st.image(cam_img, caption=f"Grad-CAM ({chosen_name})", use_column_width=True)
 
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Predicted", label)
-                m2.metric("Prob. PNEUMONIA", f"{p_pneu*100:.2f}%")
-                m3.metric("Threshold", f"{thresh:.2f}")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Predicted", label)
+                c2.metric("Prob. PNEUMONIA", f"{p_pneu*100:.2f}%")
+                c3.metric("Threshold", f"{thresh:.2f}")
 
             except Exception as e:
                 st.error(f"Grad-CAM 실패: {type(e).__name__} — {e}")
