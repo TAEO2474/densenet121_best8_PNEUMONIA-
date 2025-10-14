@@ -93,28 +93,21 @@ def ellipse_lung_mask(h, w, cy=0.48, rx=0.23, ry=0.32, gap=0.10):
 
 # ----------------------- 분리형 Grad-CAM 빌더 -----------------------
 def build_feature_and_head(model: keras.Model, last_conv_name: str):
-    """
-    input_image → densenet_preprocess → DenseNet121 → <last_conv_name>
-    경로가 끊기지 않게 2단계로 연결해 feature_extractor를 만든다.
-    이후 GAP/Dropout/Dense는 classifier_head로 그대로 통과.
-    """
-    # 1) 모델 요소 가져오기
-    input_tensor     = model.get_layer("input_image").input          # 외부 입력
-    preprocess_out   = model.get_layer("densenet_preprocess").output # preprocess 출력
-    base             = model.get_layer("densenet121")                # DenseNet 서브모델
+    preprocess_layer = model.get_layer("densenet_preprocess")
+    base             = model.get_layer("densenet121")
 
-    # 2) DenseNet 내부 그래프에서: base.input → <last_conv_name>.output
+    # DenseNet 내부 서브모델: base.input -> last_conv.output
     last_conv_tensor_inner = base.get_layer(last_conv_name).output
-    feat_inner = keras.Model(inputs=base.input, outputs=last_conv_tensor_inner, name="feat_inner")
+    feat_inner = keras.Model(base.input, last_conv_tensor_inner, name="feat_inner")
 
-    # 3) 외부 전체 그래프에 붙여주기: input_image → preprocess → feat_inner(preprocess_out)
-    last_conv_tensor_outer = feat_inner(preprocess_out)
-    feature_extractor = keras.Model(inputs=input_tensor,
-                                    outputs=last_conv_tensor_outer,
-                                    name="feature_extractor")
+    # 새 입력으로 완전 새 경로 구성 (기존 심볼릭 텐서 재사용 금지!)
+    cam_input = keras.Input(shape=model.input_shape[1:], name="cam_input")
+    z = preprocess_layer(cam_input)
+    z = feat_inner(z)
+    feature_extractor = keras.Model(cam_input, z, name="feature_extractor")
 
-    # 4) classifier head: densenet121 다음 레이어들을 그대로 재사용
-    head_input = keras.Input(shape=last_conv_tensor_inner.shape[1:], name="cam_head_in")
+    # densenet121 이후 헤드 재사용 (GAP/Dropout/Dense)
+    head_input = keras.Input(shape=z.shape[1:], name="cam_head_in")
     x = head_input
     passed = False
     for lyr in model.layers:
@@ -123,34 +116,24 @@ def build_feature_and_head(model: keras.Model, last_conv_name: str):
             continue
         if not passed:
             continue
-        # densenet121 이후 레이어들(GAP/Dropout/Dense)만 통과
         x = lyr(x)
     classifier_head = keras.Model(head_input, x, name="classifier_head")
-
     return feature_extractor, classifier_head
+ 
 
 
 # ----------------------- Grad-CAM (분리형) -----------------------
 def gradcam_separated(img_bchw: np.ndarray, model: keras.Model, last_conv_name: str, target_class: int = 1):
     x = tf.convert_to_tensor(img_bchw, dtype=tf.float32)
-    input_name = model.inputs[0].name.split(":")[0]  # 'input_image'
-
     feat, head = build_feature_and_head(model, last_conv_name)
 
     with tf.GradientTape() as tape:
-        conv_feat = feat({input_name: x}, training=False)  # ✅ 반드시 dict
+        conv_feat = feat(x, training=False)   # 위치 인자만 사용
         tape.watch(conv_feat)
         preds = head(conv_feat, training=False)
-
-        if preds.shape[-1] == 1:
-            cls = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
-        else:
-            cls = preds[:, target_class]
+        cls = preds[:, 0] if preds.shape[-1] == 1 else preds[:, target_class]
 
     grads = tape.gradient(cls, conv_feat)
-    if grads is None:
-        raise RuntimeError("Gradient is None — 레이어 이름을 'relu' 등으로 바꿔보세요.")
-
     weights = tf.reduce_mean(grads, axis=(0, 1, 2))
     cam = tf.reduce_sum(tf.nn.relu(conv_feat[0] * weights), axis=-1)
     cam = (cam - tf.reduce_min(cam)) / (tf.reduce_max(cam) - tf.reduce_min(cam) + 1e-8)
@@ -159,7 +142,6 @@ def gradcam_separated(img_bchw: np.ndarray, model: keras.Model, last_conv_name: 
     p90 = float(np.percentile(cam_np, 90.0))
     cam_np = np.clip(cam_np / (p90 + 1e-6), 0, 1)
     cam_np = cv2.GaussianBlur(cam_np, (3, 3), 0)
-
     return cam_np, float(preds.numpy().squeeze())
 
 
