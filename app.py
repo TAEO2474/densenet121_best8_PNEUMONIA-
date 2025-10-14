@@ -1,10 +1,9 @@
 # ============================================================
-# app.py — DenseNet121_BinaryClassifier (안정형 + 병변 국소화 최적화, conv5 우선)
+# app.py — DenseNet121_BinaryClassifier 전용, 확실하게 동작하는 분리형 Grad-CAM
 # ============================================================
 
 import os
 from pathlib import Path
-import re
 import numpy as np
 import streamlit as st
 import tensorflow as tf
@@ -14,22 +13,18 @@ from PIL import Image
 import cv2
 import gdown, requests
 
-# ============================================================
-# 기본 설정
-# ============================================================
+# ----------------------- 기본 설정 -----------------------
 st.set_page_config(page_title="CXR Pneumonia — DenseNet121 + Grad-CAM", layout="wide")
 CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 IMG_SIZE = (224, 224)
 
 MODEL_DIR = Path("models"); MODEL_DIR.mkdir(parents=True, exist_ok=True)
-MODEL_LOCAL = MODEL_DIR / "densenet121_best.keras"
-FILE_ID = st.secrets.get("MODEL_FILE_ID", "")
-HTTP_FALLBACK_URL = st.secrets.get("MODEL_DIRECT_URL", "")
+MODEL_LOCAL = MODEL_DIR / "densenet121_best.keras"     # ← 실제 파일명에 맞춰 수정 가능
+FILE_ID = st.secrets.get("MODEL_FILE_ID", "")          # gdown File ID (선택)
+HTTP_FALLBACK_URL = st.secrets.get("MODEL_DIRECT_URL", "")  # 직접 URL (선택)
 TIMEOUT = 120
 
-# ============================================================
-# 모델 다운로드 유틸
-# ============================================================
+# ----------------------- 다운로드 유틸 -----------------------
 def _http_download(url: str, out: Path) -> bool:
     try:
         with requests.get(url, stream=True, timeout=TIMEOUT) as r:
@@ -51,8 +46,8 @@ def ensure_model_file_cached() -> str:
             gdown.download(id=FILE_ID, output=str(MODEL_LOCAL), quiet=False, fuzzy=True)
         except Exception:
             pass
-    if MODEL_LOCAL.exists() and MODEL_LOCAL.stat().st_size > 0:
-        return str(MODEL_LOCAL)
+        if MODEL_LOCAL.exists() and MODEL_LOCAL.stat().st_size > 0:
+            return str(MODEL_LOCAL)
     if HTTP_FALLBACK_URL:
         _http_download(HTTP_FALLBACK_URL, MODEL_LOCAL)
         if MODEL_LOCAL.exists() and MODEL_LOCAL.stat().st_size > 0:
@@ -61,6 +56,7 @@ def ensure_model_file_cached() -> str:
 
 @st.cache_resource(show_spinner=False)
 def load_model(model_path: str):
+    # Lambda(preprocess_input) 복원을 위해 custom_objects 등록
     return keras.models.load_model(
         model_path,
         custom_objects={"preprocess_input": preprocess_input},
@@ -68,29 +64,11 @@ def load_model(model_path: str):
         compile=False,
     )
 
-# ============================================================
-# 안전 입력 감지 (_forward_safe)
-#  - 텐서로 먼저 시도 → 실패 시 정확 입력명 dict로 재시도
-#  - 리스트 입력이나 임의 키(dict) 시도는 금지 (mask 오류 방지)
-# ============================================================
-def _forward_safe(model_or_fn, x, training=False):
-    try:
-        return model_or_fn(x, training=training)
-    except Exception:
-        pass
-    ins = getattr(model_or_fn, "inputs", None)
-    if isinstance(ins, (list, tuple)) and len(ins) == 1:
-        in_name = ins[0].name.split(":")[0]
-        return model_or_fn({in_name: x}, training=training)
-    raise RuntimeError("Unsupported input signature (expected single tensor or single-name dict).")
-
-# ============================================================
-# 전처리 / 시각화 유틸
-# ============================================================
+# ----------------------- 전처리/시각화 -----------------------
 def prepare_inputs(pil_img: Image.Image):
     pil = pil_img.convert("RGB").resize(IMG_SIZE)
     rgb_uint8 = np.array(pil, dtype=np.uint8)
-    bchw_raw = np.expand_dims(rgb_uint8.astype(np.float32), axis=0)
+    bchw_raw = np.expand_dims(rgb_uint8.astype(np.float32), axis=0)  # (1,H,W,3)
     return rgb_uint8, bchw_raw
 
 def overlay_heatmap(rgb_uint8, heatmap, alpha=0.6):
@@ -105,86 +83,92 @@ def overlay_heatmap(rgb_uint8, heatmap, alpha=0.6):
 def ellipse_lung_mask(h, w, cy=0.48, rx=0.23, ry=0.32, gap=0.10):
     mask = np.zeros((h, w), np.uint8)
     cx = w // 2
-    cy = int(h * cy); rx = int(w * rx); ry = int(h * ry); gap = int(w * gap)
+    cy = int(h * cy)
+    rx = int(w * rx)
+    ry = int(h * ry)
+    gap = int(w * gap)
     cv2.ellipse(mask, (cx - gap, cy), (rx, ry), 0, 0, 360, 255, -1)
     cv2.ellipse(mask, (cx + gap, cy), (rx, ry), 0, 0, 360, 255, -1)
     return (mask > 0).astype(np.float32)
 
-# ============================================================
-# Grad-CAM 본체 (원본 그래프 사용, Any Layer)
-# ============================================================
-def gradcam_from_any_layer(img_bchw, model, layer_name, target_class=1):
-    base = model.get_layer("densenet121")
-    # 타깃 텐서 확보 (없으면 마지막 레이어로 폴백)
-    try:
-        target_tensor = base.get_layer(layer_name).output
-    except Exception:
-        target_tensor = base.layers[-1].output
-        layer_name = base.layers[-1].name
+# ----------------------- 분리형 Grad-CAM 빌더 -----------------------
+def build_feature_and_head(model: keras.Model, last_conv_name: str):
+    preprocess_layer = model.get_layer("densenet_preprocess")
+    base             = model.get_layer("densenet121")
 
-    cam_model = keras.Model(inputs=model.input, outputs=[target_tensor, model.output])
+    # DenseNet 내부 서브모델: base.input -> last_conv.output
+    last_conv_tensor_inner = base.get_layer(last_conv_name).output
+    feat_inner = keras.Model(base.input, last_conv_tensor_inner, name="feat_inner")
+
+    # 새 입력으로 완전 새 경로 구성 (기존 심볼릭 텐서 재사용 금지!)
+    cam_input = keras.Input(shape=model.input_shape[1:], name="cam_input")
+    z = preprocess_layer(cam_input)
+    z = feat_inner(z)
+    feature_extractor = keras.Model(cam_input, z, name="feature_extractor")
+
+    # densenet121 이후 헤드 재사용 (GAP/Dropout/Dense)
+    head_input = keras.Input(shape=z.shape[1:], name="cam_head_in")
+    x = head_input
+    passed = False
+    for lyr in model.layers:
+        if lyr.name == "densenet121":
+            passed = True
+            continue
+        if not passed:
+            continue
+        x = lyr(x)
+    classifier_head = keras.Model(head_input, x, name="classifier_head")
+    return feature_extractor, classifier_head
+
+# ----------------------- Grad-CAM (분리형) -----------------------
+def gradcam_separated(img_bchw: np.ndarray, model: keras.Model, last_conv_name: str, target_class: int = 1):
     x = tf.convert_to_tensor(img_bchw, dtype=tf.float32)
+    feat, head = build_feature_and_head(model, last_conv_name)
 
     with tf.GradientTape() as tape:
-        conv_feat, preds = _forward_safe(cam_model, x, training=False)
+        conv_feat = feat(x, training=False)   # 위치 인자만 사용
+        tape.watch(conv_feat)
+        preds = head(conv_feat, training=False)
         cls = preds[:, 0] if preds.shape[-1] == 1 else preds[:, target_class]
-    grads = tape.gradient(cls, conv_feat)
-    # 드물게 None이면 미세잡음 추가 후 재계산
-    if grads is None:
-        conv_feat = conv_feat + tf.random.normal(tf.shape(conv_feat), stddev=1e-8)
-        with tf.GradientTape() as t2:
-            _, preds2 = _forward_safe(cam_model, x, training=False)
-            cls2 = preds2[:, 0] if preds2.shape[-1] == 1 else preds2[:, target_class]
-        grads = t2.gradient(cls2, conv_feat)
 
+    grads = tape.gradient(cls, conv_feat)
     weights = tf.reduce_mean(grads, axis=(0, 1, 2))
     cam = tf.reduce_sum(tf.nn.relu(conv_feat[0] * weights), axis=-1)
     cam = (cam - tf.reduce_min(cam)) / (tf.reduce_max(cam) - tf.reduce_min(cam) + 1e-8)
-    return cam.numpy().astype(np.float32), float(preds.numpy().squeeze()), layer_name
 
-# ============================================================
-# 유틸: conv5/conv4 자동 선택 (concat)
-# ============================================================
-def _sorted_concats(names):
-    concats = [n for n in names if n.endswith("_concat") and "block" in n]
-    def key(n):
-        m = re.search(r"conv(\d+)_block(\d+)_concat", n)
-        return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
-    return sorted(concats, key=key)
+    cam_np = cam.numpy().astype(np.float32)
+    p90 = float(np.percentile(cam_np, 90.0))
+    cam_np = np.clip(cam_np / (p90 + 1e-6), 0, 1)
+    cam_np = cv2.GaussianBlur(cam_np, (3, 3), 0)
+    return cam_np, float(preds.numpy().squeeze())
 
-def pick_deep_and_prev(names):
-    concats = _sorted_concats(names)
-    if not concats: return None, None
-    deep = concats[-1]
-    prev = concats[-2] if len(concats) >= 2 else None
-    return deep, prev
+def predict_prob(model, bchw_raw):
+    input_name = model.inputs[0].name.split(":")[0]
+    prob = model({input_name: bchw_raw}, training=False)
+    if isinstance(prob, (list, tuple)):
+        prob = prob[0]
+    return float(np.asarray(prob).squeeze())
 
-# ============================================================
-# Sidebar
-# ============================================================
+# ----------------------- Sidebar -----------------------
 with st.sidebar:
     st.header("⚙️ Settings")
     thresh = st.slider("Decision threshold (PNEUMONIA)", 0.40, 0.75, 0.69, 0.01)
+    st.caption("• 낮추면 민감도↑ • 높이면 정상 보호(오탐↓)")
 
     st.divider()
-    st.subheader("Grad-CAM target")
-    st.caption("기본: conv5_block16_concat → 없으면 relu → 마지막 레이어")
-    use_multiscale = st.checkbox("Use multiscale (conv5 × conv4^γ)", value=True)
-    fusion_gamma = st.slider("γ (conv4 exponent)", 0.3, 1.5, 0.7, 0.1)
+    st.subheader("Grad-CAM layer (DenseNet 내부)")
+    st.caption("권장: 마지막 활성화 **relu**. 필요하면 conv4/conv5 concat도 비교 가능.")
 
     st.divider()
-    st.subheader("Refine")
-    cam_percentile = st.slider("Percentile clip", 80, 99, 97, 1)
+    st.subheader("Lung mask (optional)")
     use_mask = st.checkbox("Apply ellipse lung mask", value=True)
-    cy = st.slider("mask center y", 0.35, 0.60, 0.48, 0.01)
-    rx = st.slider("mask radius x", 0.15, 0.35, 0.23, 0.01)
-    ry = st.slider("mask radius y", 0.20, 0.45, 0.32, 0.01)
-    gap = st.slider("mask gap", 0.05, 0.20, 0.10, 0.01)
+    cy = st.slider("center y", 0.35, 0.60, 0.48, 0.01)
+    rx = st.slider("radius x", 0.15, 0.35, 0.23, 0.01)
+    ry = st.slider("radius y", 0.20, 0.45, 0.32, 0.01)
+    gap = st.slider("gap", 0.05, 0.20, 0.10, 0.01)
 
-# ============================================================
-# Main
-# ============================================================
-st.title("🩻 Chest X-ray Pneumonia — DenseNet121 + Grad-CAM (Optimized)")
+# ----------------------- Main -----------------------
+st.title("🩻 Chest X-ray Pneumonia — DenseNet121 + Grad-CAM (Separated)")
 st.caption("의사용 장비가 아닙니다. 참고용 해석 도구입니다.")
 
 # 모델 로드
@@ -195,30 +179,21 @@ except Exception as e:
     st.error(f"모델 로딩 실패: {e}")
     st.stop()
 
-# DenseNet 내부 레이어 이름 수집
+# DenseNet 내부 레이어 목록 & 기본값
 base = model.get_layer("densenet121")
 all_names = [l.name for l in base.layers]
-
-# 기본 타깃: conv5 우선 → relu → 마지막
-if "conv5_block16_concat" in all_names:
-    default_target = "conv5_block16_concat"
-elif "relu" in all_names:
-    default_target = "relu"
-else:
-    default_target = all_names[-1]
-
-# 드롭다운(원하면 바꿔볼 수 있게)
-cands = [n for n in all_names if ("relu" in n) or ("_concat" in n and "block" in n)]
-if default_target not in cands:
-    cands.append(default_target)
-cands = sorted(set(cands))
-chosen_name = st.sidebar.selectbox("Select CAM layer", cands, index=cands.index(default_target))
+# candidate: relu + concat 계열 위주
+cands = [n for n in all_names if ("relu" in n or "concat" in n or "conv5_block" in n or "conv4_block" in n)]
+cands = sorted(set(cands), key=lambda s: (("conv4" not in s, "conv5" not in s, "relu" not in s), s))
+default_name = "relu" if "relu" in all_names else (cands[-1] if cands else all_names[-1])
+chosen_name = st.sidebar.selectbox("Select CAM target layer", cands or all_names, index=(cands or all_names).index(default_name))
 
 # 업로드 & 실행
 up = st.file_uploader("Upload an X-ray (JPG/PNG)", type=["jpg", "jpeg", "png"])
 if up:
     pil_img = Image.open(up)
     rgb_uint8, x_raw_bchw = prepare_inputs(pil_img)
+
     col1, col2 = st.columns(2)
     with col1:
         st.image(rgb_uint8, caption="Input (224×224)", use_column_width=True)
@@ -226,39 +201,22 @@ if up:
     if st.button("Run Grad-CAM"):
         with st.spinner("Running…"):
             try:
-                # --- 타깃 계산 ---
-                deep, prev = pick_deep_and_prev(all_names)
+                heatmap, p_pneu = gradcam_separated(x_raw_bchw, model, chosen_name, target_class=1)
+                label = "PNEUMONIA" if p_pneu >= thresh else "NORMAL"
 
-                # 멀티스케일: conv5 × (conv4^γ)
-                if use_multiscale and deep and prev:
-                    cam5, p1, used5 = gradcam_from_any_layer(x_raw_bchw, model, deep, target_class=1)
-                    cam4, _,  used4 = gradcam_from_any_layer(x_raw_bchw, model, prev, target_class=1)
-                    cam5 = cam5 / (cam5.max() + 1e-6)
-                    cam4 = cam4 / (cam4.max() + 1e-6)
-                    cam = cam5 * (cam4 ** fusion_gamma)
-                    layer_label = f"{used5} × {used4}^{fusion_gamma:.2f}"
-                else:
-                    cam, p1, used = gradcam_from_any_layer(x_raw_bchw, model, chosen_name, target_class=1)
-                    layer_label = used
-
-                # 퍼짐 억제: Percentile clip (기본 97)
-                cam = np.clip(cam / (np.percentile(cam, cam_percentile) + 1e-6), 0, 1)
-
-                # 마스크 적용
                 if use_mask:
-                    h, w = cam.shape
-                    lung = ellipse_lung_mask(h, w, cy, rx, ry, gap)
-                    cam *= lung
+                    mh, mw = heatmap.shape
+                    m = ellipse_lung_mask(mh, mw, cy, rx, ry, gap)
+                    heatmap = heatmap * m
 
-                # 오버레이 & 메트릭
-                cam_img = overlay_heatmap(rgb_uint8, cam)
-                label = "PNEUMONIA" if p1 >= thresh else "NORMAL"
+                cam_img = overlay_heatmap(rgb_uint8, heatmap)
 
                 with col2:
-                    st.image(cam_img, caption=f"Grad-CAM ({layer_label})", use_column_width=True)
+                    st.image(cam_img, caption=f"Grad-CAM ({chosen_name})", use_column_width=True)
+
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Predicted", label)
-                c2.metric("Prob. PNEUMONIA", f"{p1*100:.2f}%")
+                c2.metric("Prob. PNEUMONIA", f"{p_pneu*100:.2f}%")
                 c3.metric("Threshold", f"{thresh:.2f}")
 
             except Exception as e:
