@@ -145,12 +145,13 @@ def gradcam_separated(img_bchw: np.ndarray, model: keras.Model, last_conv_name: 
     return cam_np, float(preds.numpy().squeeze())
 
 
-def predict_prob(model: keras.Model, bchw_raw: np.ndarray) -> float:
+def predict_prob(model, bchw_raw):
     input_name = model.inputs[0].name.split(":")[0]
-    prob = model({input_name: bchw_raw}, training=False)   # ✅ dict only
+    prob = model({input_name: bchw_raw}, training=False)
     if isinstance(prob, (list, tuple)):
         prob = prob[0]
     return float(np.asarray(prob).squeeze())
+
 
 # ----------------------- Sidebar -----------------------
 with st.sidebar:
