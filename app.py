@@ -94,24 +94,28 @@ def ellipse_lung_mask(h, w, cy=0.48, rx=0.23, ry=0.32, gap=0.10):
 # ----------------------- 분리형 Grad-CAM 빌더 -----------------------
 def build_feature_and_head(model: keras.Model, last_conv_name: str):
     """
-    preprocess 서브모델은 만들지 않음!
-    'input_image'를 입력으로 받아
-    input_image → densenet_preprocess → densenet121 → <last_conv_name>
-    까지 바로 잇는 feature_extractor만 생성.
-    이후의 GAP/Dropout/Dense는 classifier_head로 재구성.
+    input_image → densenet_preprocess → DenseNet121 → <last_conv_name>
+    경로가 끊기지 않게 2단계로 연결해 feature_extractor를 만든다.
+    이후 GAP/Dropout/Dense는 classifier_head로 그대로 통과.
     """
-    input_tensor = model.get_layer("input_image").input   # 전체 입력
-    base = model.get_layer("densenet121")
+    # 1) 모델 요소 가져오기
+    input_tensor     = model.get_layer("input_image").input          # 외부 입력
+    preprocess_out   = model.get_layer("densenet_preprocess").output # preprocess 출력
+    base             = model.get_layer("densenet121")                # DenseNet 서브모델
 
-    # DenseNet 내부의 타깃 텐서(예: 'relu' 또는 'conv4_block24_concat')
-    last_conv_tensor = base.get_layer(last_conv_name).output
+    # 2) DenseNet 내부 그래프에서: base.input → <last_conv_name>.output
+    last_conv_tensor_inner = base.get_layer(last_conv_name).output
+    feat_inner = keras.Model(inputs=base.input, outputs=last_conv_tensor_inner, name="feat_inner")
 
-    # feature_extractor: input_image → ... → last_conv_tensor
-    feature_extractor = keras.Model(inputs=input_tensor, outputs=last_conv_tensor, name="feature_extractor")
+    # 3) 외부 전체 그래프에 붙여주기: input_image → preprocess → feat_inner(preprocess_out)
+    last_conv_tensor_outer = feat_inner(preprocess_out)
+    feature_extractor = keras.Model(inputs=input_tensor,
+                                    outputs=last_conv_tensor_outer,
+                                    name="feature_extractor")
 
-    # classifier_head: densenet121 이후 레이어를 그대로 통과
-    head_in = keras.Input(shape=last_conv_tensor.shape[1:], name="cam_head_in")
-    x = head_in
+    # 4) classifier head: densenet121 다음 레이어들을 그대로 재사용
+    head_input = keras.Input(shape=last_conv_tensor_inner.shape[1:], name="cam_head_in")
+    x = head_input
     passed = False
     for lyr in model.layers:
         if lyr.name == "densenet121":
@@ -119,46 +123,45 @@ def build_feature_and_head(model: keras.Model, last_conv_name: str):
             continue
         if not passed:
             continue
+        # densenet121 이후 레이어들(GAP/Dropout/Dense)만 통과
         x = lyr(x)
-    classifier_head = keras.Model(head_in, x, name="classifier_head")
+    classifier_head = keras.Model(head_input, x, name="classifier_head")
+
     return feature_extractor, classifier_head
+
 
 # ----------------------- Grad-CAM (분리형) -----------------------
 def gradcam_separated(img_bchw: np.ndarray, model: keras.Model, last_conv_name: str, target_class: int = 1):
-    """
-    항상 '이름-딕셔너리'로만 호출해서 그래프 매핑 고정.
-    """
     x = tf.convert_to_tensor(img_bchw, dtype=tf.float32)
-    input_name = model.inputs[0].name.split(":")[0]  # 보통 'input_image'
+    input_name = model.inputs[0].name.split(":")[0]  # 'input_image'
 
     feat, head = build_feature_and_head(model, last_conv_name)
 
     with tf.GradientTape() as tape:
-        conv_feat = feat({input_name: x}, training=False)   # ✅ dict only
+        conv_feat = feat({input_name: x}, training=False)  # ✅ 반드시 dict
         tape.watch(conv_feat)
         preds = head(conv_feat, training=False)
 
-        # 이진(sigmoid) 기준
         if preds.shape[-1] == 1:
             cls = preds[:, 0] if target_class == 1 else (1.0 - preds[:, 0])
         else:
             cls = preds[:, target_class]
 
-    grads = tape.gradient(cls, conv_feat)                  # [1,Hc,Wc,C]
+    grads = tape.gradient(cls, conv_feat)
     if grads is None:
         raise RuntimeError("Gradient is None — 레이어 이름을 'relu' 등으로 바꿔보세요.")
 
-    weights = tf.reduce_mean(grads, axis=(0, 1, 2))        # [C]
-    cam = tf.reduce_sum(tf.nn.relu(conv_feat[0] * weights), axis=-1)  # [Hc,Wc]
+    weights = tf.reduce_mean(grads, axis=(0, 1, 2))
+    cam = tf.reduce_sum(tf.nn.relu(conv_feat[0] * weights), axis=-1)
     cam = (cam - tf.reduce_min(cam)) / (tf.reduce_max(cam) - tf.reduce_min(cam) + 1e-8)
-    cam_np = cam.numpy().astype(np.float32)
 
-    # 살짝 대비 + 은은한 블러
+    cam_np = cam.numpy().astype(np.float32)
     p90 = float(np.percentile(cam_np, 90.0))
     cam_np = np.clip(cam_np / (p90 + 1e-6), 0, 1)
     cam_np = cv2.GaussianBlur(cam_np, (3, 3), 0)
 
     return cam_np, float(preds.numpy().squeeze())
+
 
 def predict_prob(model: keras.Model, bchw_raw: np.ndarray) -> float:
     input_name = model.inputs[0].name.split(":")[0]
