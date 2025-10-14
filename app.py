@@ -245,7 +245,7 @@ if up:
                 m = ellipse_lung_mask(mh, mw, cy, rx, ry, gap)
                 heatmap = heatmap * m
 
-            # 5) 분류 라벨 결정(Threshold는 그대로)
+            # 5) 분류 라벨 결정
             label = "PNEUMONIA" if p_pneu >= thresh else "NORMAL"
 
             # 6) 오버레이 렌더
@@ -263,4 +263,5 @@ if up:
             st.error(f"Grad-CAM 실패: {type(e).__name__} — {e}")
 else:
     st.info("⬆️ X-ray 이미지를 업로드하세요.")
+
 
