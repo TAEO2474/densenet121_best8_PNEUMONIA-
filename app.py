@@ -19,7 +19,7 @@ CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
 IMG_SIZE = (224, 224)
 
 MODEL_DIR = Path("models"); MODEL_DIR.mkdir(parents=True, exist_ok=True)
-MODEL_LOCAL = MODEL_DIR / "densenet121_best.keras"     # ← 실제 파일명에 맞춰 수정 가능
+MODEL_LOCAL = MODEL_DIR / "densenet121_best_9.keras"     # ← 실제 파일명에 맞춰 수정 가능
 FILE_ID = st.secrets.get("MODEL_FILE_ID", "")          # gdown File ID (선택)
 HTTP_FALLBACK_URL = st.secrets.get("MODEL_DIRECT_URL", "")  # 직접 URL (선택)
 TIMEOUT = 120
